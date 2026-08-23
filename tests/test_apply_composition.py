@@ -139,14 +139,6 @@ class ApplyCompositionTests(unittest.TestCase):
             return_value=(object(), 50),
         ), mock.patch.object(
             apply_module,
-            'install_v_layout_compat',
-            return_value=SimpleNamespace(
-                state='installed',
-                reason='synthetic',
-                patched_blocks=50,
-            ),
-        ), mock.patch.object(
-            apply_module,
             'install_dense_attention',
             return_value=True,
         ), mock.patch.object(
@@ -320,14 +312,6 @@ class ApplyCompositionTests(unittest.TestCase):
             '_resolve_fp8_flex',
             side_effect=apply_module.FP8FlexError(
                 'FP8 FlexAttention is unavailable'
-            ),
-        ), mock.patch.object(
-            apply_module,
-            'install_v_layout_compat',
-            return_value=SimpleNamespace(
-                state='installed',
-                reason='synthetic',
-                patched_blocks=50,
             ),
         ), mock.patch.object(
             apply_module,
