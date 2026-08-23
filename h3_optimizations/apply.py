@@ -77,10 +77,6 @@ from .runtime.context import (
     RUNTIME_SESSION_KEY,
     install_runtime_wrapper,
 )
-from .v_layout_compat import (
-    install_v_layout_compat,
-    not_applicable_v_layout,
-)
 
 LOG_PREFIX = '[H3 Optimizations]'
 ATTENTION_SPARSE = 'sparse_sage'
@@ -561,7 +557,6 @@ def _status(
     mlp_sharing_installed,
     runtime_installed,
     inventory,
-    v_layout,
 ):
     return {
         'plan_version': int(plan.version),
@@ -571,11 +566,6 @@ def _status(
             'selected': attention.selected,
             'reason': attention.reason,
             'patched_blocks': int(attention_blocks),
-        },
-        'v_layout': {
-            'state': v_layout.state,
-            'reason': v_layout.reason,
-            'patched_blocks': int(v_layout.patched_blocks),
         },
         'sparse': (
             None
@@ -695,9 +685,6 @@ def apply_plan(model, plan: H3OptimizationPlan):
             )
         if flex_dense_fallback and attention.dense_resolution is not None:
             install_dense_attention(patched, attention.dense_resolution)
-        v_layout = not_applicable_v_layout(
-            '%s owns the main H3 forward' % attention.selected
-        )
     elif plan.memory is not None:
         if qkv.provider_id in (
             QKV_DENSE_KITCHEN_CHUNKED,
@@ -709,17 +696,7 @@ def apply_plan(model, plan: H3OptimizationPlan):
                 projector=attention.projector,
                 projector_fallback_to_original=True,
             )
-            v_layout = not_applicable_v_layout(
-                'chunked Kitchen QKV owns the main H3 forward'
-            )
-        else:
-            v_layout = install_v_layout_compat(patched)
-            attention_blocks = int(v_layout.patched_blocks)
         install_dense_attention(patched, attention.dense_resolution)
-    else:
-        v_layout = not_applicable_v_layout(
-            'no H3 Memory Optimization request'
-        )
 
     mlp, mlp_blocks = _install_mlp(
         patched,
@@ -758,14 +735,12 @@ def apply_plan(model, plan: H3OptimizationPlan):
         mlp_sharing_installed=mlp_sharing_installed,
         runtime_installed=runtime_installed,
         inventory=inventory,
-        v_layout=v_layout,
     )
     _warn_about_slow_paths(attention, qkv)
     logging.info(
-        '%s armed: attention=%s v_layout=%s qkv=%s mlp=%s device=%s',
+        '%s armed: attention=%s qkv=%s mlp=%s device=%s',
         LOG_PREFIX,
         attention.selected,
-        v_layout.state,
         qkv.provider_id,
         mlp.provider_id,
         environment.device_name,
