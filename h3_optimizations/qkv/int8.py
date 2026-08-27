@@ -25,7 +25,16 @@ class ConvRotINT8BindingError(RuntimeError):
 
 
 class HeldConvRotINT8Linear:
-    """Hold one native or runtime-quantized ConvRot-256 linear weight."""
+    """Hold one native, effective-float, or runtime-quantized H3 linear.
+
+    The stored checkpoint format chooses this binding, but Comfy's runtime
+    weight patches are authoritative.  In native/preserve mode, if
+    ``cast_bias_weight`` materializes a BF16/FP16 effective weight (for example
+    because a LoRA/adapter weight_function is active), execute that effective
+    value directly instead of pretending the stored ConvRot tensor is still
+    the live weight.  Explicit force-quant callers set ``allow_float_conversion``
+    and therefore requantize the effective value back to ConvRot-256.
+    """
 
     def __init__(self, module, sample, *, allow_float_conversion=False):
         self.module = module
@@ -37,6 +46,7 @@ class HeldConvRotINT8Linear:
         self.acquired_bias = None
         self.handle = None
         self.converted_from_float = False
+        self.effective_float = False
 
     def _release_acquired(self):
         if self.handle is not None:
@@ -75,11 +85,11 @@ class HeldConvRotINT8Linear:
         self.acquired_bias = bias
         self.handle = handle
         try:
-            if bias is not None:
-                raise ConvRotINT8BindingError(
-                    "ConvRot INT8 conversion requires bias-free H3 linears"
-                )
             if isinstance(weight, QuantizedTensor):
+                if bias is not None:
+                    raise ConvRotINT8BindingError(
+                        "ConvRot INT8 conversion requires bias-free H3 linears"
+                    )
                 actual = describe_weight(weight, bias=bias)
                 if not actual.convrot_int8_256:
                     raise ConvRotINT8BindingError(
@@ -87,11 +97,8 @@ class HeldConvRotINT8Linear:
                         % getattr(weight, "_layout_cls", None)
                     )
                 self.weight = weight
+                self.bias = None
             else:
-                if not self.allow_float_conversion or not source.plain_float:
-                    raise ConvRotINT8BindingError(
-                        "ConvRot INT8 provider received a floating weight without conversion enabled"
-                    )
                 if getattr(weight, "dtype", None) not in (
                     torch.bfloat16,
                     torch.float16,
@@ -100,17 +107,35 @@ class HeldConvRotINT8Linear:
                         "ConvRot INT8 conversion requires BF16/FP16 weights, got %s"
                         % getattr(weight, "dtype", None)
                     )
-                self.weight = QuantizedTensor.from_float(
-                    weight,
-                    LAYOUT,
-                    scale="recalculate",
-                    is_weight=True,
-                    per_channel=True,
-                    convrot=True,
-                    convrot_groupsize=GROUP_SIZE,
-                )
-                self.converted_from_float = True
-                self._release_acquired()
+                if self.allow_float_conversion:
+                    if bias is not None:
+                        raise ConvRotINT8BindingError(
+                            "ConvRot INT8 conversion requires bias-free H3 linears"
+                        )
+                    self.weight = QuantizedTensor.from_float(
+                        weight,
+                        LAYOUT,
+                        scale="recalculate",
+                        is_weight=True,
+                        per_channel=True,
+                        convrot=True,
+                        convrot_groupsize=GROUP_SIZE,
+                    )
+                    self.bias = None
+                    self.converted_from_float = True
+                    self._release_acquired()
+                elif source.convrot_int8_256:
+                    # Runtime patches can force Comfy to materialize the
+                    # effective value in compute dtype even though the stored
+                    # checkpoint tensor is ConvRot INT8. Preserve that exact
+                    # effective value in native mode.
+                    self.weight = weight
+                    self.bias = bias
+                    self.effective_float = True
+                else:
+                    raise ConvRotINT8BindingError(
+                        "ConvRot INT8 provider received a floating weight without conversion enabled"
+                    )
             return self
         except Exception:
             self.release()
@@ -121,42 +146,47 @@ class HeldConvRotINT8Linear:
         self.weight = None
         self.bias = None
         self.sample = None
+        self.effective_float = False
 
     def __exit__(self, exc_type, exc, tb):
         self.release()
         return False
 
-    def _linear(self, x, weight):
+    def _linear(self, x, weight, bias=None):
         override = getattr(
             self.module,
             "_h3_benchmark_convrot_linear",
             None,
         )
-        if override is not None:
+        if override is not None and isinstance(weight, QuantizedTensor):
             if not callable(override):
                 raise ConvRotINT8BindingError(
                     "benchmark ConvRot linear override is not callable"
                 )
-            return override(x, weight, self.bias)
-        return F.linear(x, weight, self.bias)
+            return override(x, weight, bias)
+        return F.linear(x, weight, bias)
 
     def linear(self, x):
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
         comfy.ops.run_every_op()
-        return self._linear(x, self.weight)
+        return self._linear(x, self.weight, self.bias)
 
     def linear_range(self, x, start, end):
         if self.weight is None:
             raise RuntimeError("ConvRot INT8 binding is not active")
-        if self.bias is not None:
-            raise ConvRotINT8BindingError(
-                "ConvRot INT8 output slicing requires a bias-free linear"
-            )
         start = int(start)
         end = int(end)
         if not 0 <= start < end <= int(self.weight.shape[0]):
             raise ConvRotINT8BindingError("ConvRot INT8 output slice is invalid")
+        if not isinstance(self.weight, QuantizedTensor):
+            bias = None if self.bias is None else self.bias[start:end]
+            comfy.ops.run_every_op()
+            return self._linear(x, self.weight[start:end], bias)
+        if self.bias is not None:
+            raise ConvRotINT8BindingError(
+                "ConvRot INT8 output slicing requires a bias-free linear"
+            )
         params = self.weight._params
         scale = params.scale
         if scale.numel() != 1:
@@ -171,7 +201,7 @@ class HeldConvRotINT8Linear:
             ),
         )
         comfy.ops.run_every_op()
-        return self._linear(x, sliced)
+        return self._linear(x, sliced, None)
 
 
 class HeldConvRotINT8QKV:
