@@ -27,8 +27,27 @@ class StreamedQKVBindingError(RuntimeError):
     pass
 
 
+def _has_runtime_weight_patch(linear):
+    """Whether Comfy may materialize an effective weight for this linear.
+
+    LoRAs, adapters and similar ModelPatcher features are represented through
+    weight/bias functions.  Their effective runtime value is authoritative over
+    the checkpoint storage layout.  This intentionally does not identify the
+    extension that installed the patch.
+    """
+    return bool(getattr(linear, "weight_function", ())) or bool(
+        getattr(linear, "bias_function", ())
+    )
+
+
 def _native_binding(module, sample):
-    actual = describe_linear(module.qkv_proj)
+    linear = module.qkv_proj
+    actual = describe_linear(linear)
+    if _has_runtime_weight_patch(linear):
+        # Preserve semantics: native/auto mode follows the effective value
+        # Comfy computes after all runtime weight patches.  Bounded/streamed
+        # projection keeps activation VRAM low even when that value is BF16.
+        return HeldBF16QKV(module, sample, allow_quantized_source=True)
     if actual.convrot_int8_256:
         return HeldConvRotINT8QKV(module, sample)
     if actual.w4a8:
@@ -44,7 +63,13 @@ def _native_binding(module, sample):
 
 
 def create_held_qkv(module, sample, projection_mode=PROJECTION_NATIVE):
-    """Create, but do not enter, the requested execution-scoped QKV binding."""
+    """Create, but do not enter, the requested execution-scoped QKV binding.
+
+    Explicit force modes remain authoritative even when runtime weight patches
+    exist: force BF16 materializes the effective value in BF16, while force FP8
+    or INT8 requantizes the effective value.  Native mode preserves the effective
+    precision chosen by Comfy.
+    """
     if projection_mode not in PROJECTION_MODES:
         raise ValueError("unknown streamed QKV projection mode %r" % projection_mode)
     if projection_mode == PROJECTION_FORCE_BF16:
