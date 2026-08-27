@@ -23,7 +23,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 import comfy.ops  # noqa: E402
-from comfy.quant_ops import TensorWiseINT8Layout  # noqa: E402
+from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout  # noqa: E402
 from h3_optimizations.qkv.int8 import (  # noqa: E402
     HeldConvRotINT8Linear,
     LazyConvRotINT8Linear,
@@ -37,6 +37,25 @@ def floating_linear(weight, bias=None):
         weight=weight,
         bias=bias,
         weight_function=[],
+        bias_function=[],
+        _full_precision_mm=False,
+    )
+
+
+def convrot_linear(weight):
+    quantized = QuantizedTensor.from_float(
+        weight,
+        "TensorWiseINT8Layout",
+        scale="recalculate",
+        is_weight=True,
+        per_channel=True,
+        convrot=True,
+        convrot_groupsize=256,
+    )
+    return SimpleNamespace(
+        weight=quantized,
+        bias=None,
+        weight_function=[object()],
         bias_function=[],
         _full_precision_mm=False,
     )
@@ -81,6 +100,55 @@ class RuntimeConvRotINT8Tests(unittest.TestCase):
                 None,
                 handle,
             )
+
+    def test_native_convrot_preserves_runtime_effective_float(self):
+        module = convrot_linear(self.weight)
+        effective = (self.weight + 0.125).contiguous()
+        bias = torch.randn((256,), dtype=torch.bfloat16)
+        handle = object()
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(effective, bias, handle),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight") as release:
+            with HeldConvRotINT8Linear(module, self.sample[:1]) as binding:
+                self.assertTrue(binding.effective_float)
+                self.assertFalse(binding.converted_from_float)
+                self.assertIs(binding.weight, effective)
+                full = binding.linear(self.sample)
+                sliced = torch.cat(
+                    (
+                        binding.linear_range(self.sample, 0, 96),
+                        binding.linear_range(self.sample, 96, 256),
+                    ),
+                    dim=-1,
+                )
+                expected = torch.nn.functional.linear(self.sample, effective, bias)
+                torch.testing.assert_close(full, expected, rtol=0, atol=0)
+                torch.testing.assert_close(sliced, expected, rtol=0, atol=0)
+
+        release.assert_called_once_with(module, effective, bias, handle)
+
+    def test_force_quant_requantizes_runtime_effective_float(self):
+        module = convrot_linear(self.weight)
+        effective = (self.weight + 0.125).contiguous()
+        handle = object()
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(effective, None, handle),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight") as release:
+            with HeldConvRotINT8Linear(
+                module,
+                self.sample[:1],
+                allow_float_conversion=True,
+            ) as binding:
+                self.assertFalse(binding.effective_float)
+                self.assertTrue(binding.converted_from_float)
+                self.assertIsInstance(binding.weight, QuantizedTensor)
+                self.assertEqual(binding.weight._layout_cls, "TensorWiseINT8Layout")
+
+        release.assert_called_once_with(module, effective, None, handle)
 
     def test_fp16_activation_uses_convrot_layout(self):
         sample = self.sample.to(torch.float16)
