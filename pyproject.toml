@@ -1,6 +1,6 @@
 [project]
 name = 'h3-optimizations'
-version = '0.2.33'
+version = '0.2.34'
 description = 'Production Sparse Attention and memory optimization nodes for MiniMax H3 in ComfyUI'
 readme = 'README.md'
 requires-python = '>=3.10'
