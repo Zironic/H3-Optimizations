@@ -28,6 +28,8 @@ from ..qkv.int8 import (
 )
 
 LOG_PREFIX = '[H3 Optimizations]'
+_ATTENTION_FALLBACK_LOGGED = set()
+
 
 def _mod_row(values, selector, dtype):
     if torch.is_tensor(selector) and selector.device != values.device:
@@ -181,7 +183,6 @@ def make_forward(block, layer_index, config, original_forward=None):
     '''Build an unbound replacement for one MiniMax H3 DiT block.'''
 
     original_forward = original_forward or block.forward
-    attention_fallback_logged = False
     if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
         bind_convrot_mlp(block.mlp)
 
@@ -192,7 +193,6 @@ def make_forward(block, layer_index, config, original_forward=None):
         rope_freqs,
         transformer_options={},
     ):
-        nonlocal attention_fallback_logged
         if comfy.model_management.in_training:
             raise RuntimeError(
                 'H3 Memory Optimization is inference-only; training requires '
@@ -246,17 +246,20 @@ def make_forward(block, layer_index, config, original_forward=None):
         except NormalizedRowsUnsupported as exc:
             if not isinstance(h, NormalizedRows):
                 raise
-            # This attention consumer wants a real tensor. Materialize once and
-            # retry; attention does not mutate its input, so the retry is safe.
-            if not attention_fallback_logged:
-                logging.warning(
-                    '%s block %d materialized lazy Norm1 rows for its attention '
-                    'consumer: %s',
+            # This attention forward cannot consume lazy normalized rows. Fall
+            # back to standard materialized Norm1; output remains correct, but
+            # the Norm1 fusion memory saving is unavailable for this path.
+            reason = str(exc)
+            if reason not in _ATTENTION_FALLBACK_LOGGED:
+                logging.info(
+                    '%s Norm1 fusion is unavailable for this attention forward '
+                    '(first seen in block %d); using standard Norm1 instead. '
+                    'This only uses slightly more VRAM. Detail: %s',
                     LOG_PREFIX,
                     layer_index,
-                    exc,
+                    reason,
                 )
-                attention_fallback_logged = True
+                _ATTENTION_FALLBACK_LOGGED.add(reason)
             h = h.materialize()
             attn_out = block.attn(
                 h,
