@@ -115,9 +115,10 @@ class AIMDOLimiterTests(unittest.TestCase):
         residency = schema.inputs[1]
         self.assertEqual(
             residency.options,
-            ['stock', '0 blocks', '1 block', '2 blocks', '4 blocks'],
+            ['0 blocks', '1 block', '2 blocks', '4 blocks', 'stock'],
         )
         self.assertEqual(residency.default, '0 blocks')
+        self.assertEqual(residency.options[0], residency.default)
         self.assertIn('default for benchmarking', residency.tooltip)
         self.assertIn('keeps no H3 model blocks persistently resident', residency.tooltip)
         self.assertIn('require DynamicVRAM', residency.tooltip)
