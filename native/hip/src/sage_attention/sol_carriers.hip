@@ -15,24 +15,24 @@ namespace {
 
 constexpr int HD = kHeadDim;
 
-template <typename T>
+template <typename scalar_t>
 __global__ __launch_bounds__(HD) void kmean_kernel(
-    const T* __restrict__ k, float* __restrict__ mean, int H, int T,
+    const scalar_t* __restrict__ k, float* __restrict__ mean, int H, int T,
     int64_t stride_h, int64_t stride_n) {
     const int h = blockIdx.x, d = threadIdx.x;
     float sum = 0.f;
-    const T* head = k + static_cast<int64_t>(h) * stride_h;
+    const scalar_t* head = k + static_cast<int64_t>(h) * stride_h;
     for (int t = 0; t < T; ++t) sum += static_cast<float>(head[static_cast<int64_t>(t) * stride_n + d]);
     mean[static_cast<size_t>(h) * HD + d] = sum / static_cast<float>(T);
 }
 
-template <typename T>
+template <typename scalar_t>
 __global__ __launch_bounds__(kBlock) void quant_q_kernel(
-    const T* __restrict__ q, int8_t* __restrict__ qi, float* __restrict__ qs,
+    const scalar_t* __restrict__ q, int8_t* __restrict__ qi, float* __restrict__ qs,
     int H, int T, int64_t stride_h, int64_t stride_n) {
     const int h = blockIdx.y, t = blockIdx.x * kBlock + threadIdx.x;
     if (t >= T) return;
-    const T* row = q + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t) * stride_n;
+    const scalar_t* row = q + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t) * stride_n;
     float a = 0.f;
 #pragma unroll
     for (int d = 0; d < HD; ++d) a = fmaxf(a, fabsf(static_cast<float>(row[d])));
@@ -48,9 +48,9 @@ __global__ __launch_bounds__(kBlock) void quant_q_kernel(
     }
 }
 
-template <typename T>
+template <typename scalar_t>
 __global__ __launch_bounds__(kBlock) void quant_k_kernel(
-    const T* __restrict__ k, const float* __restrict__ mean, int8_t* __restrict__ ki,
+    const scalar_t* __restrict__ k, const float* __restrict__ mean, int8_t* __restrict__ ki,
     float2* __restrict__ ksb, int H, int T, int Tp, int64_t stride_h, int64_t stride_n) {
     const int h = blockIdx.y, t = blockIdx.x * kBlock + threadIdx.x;
     if (t >= Tp) return;
@@ -61,7 +61,7 @@ __global__ __launch_bounds__(kBlock) void quant_k_kernel(
         ksb[static_cast<size_t>(h) * Tp + t] = make_float2(0.f, kNeg);
         return;
     }
-    const T* row = k + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t) * stride_n;
+    const scalar_t* row = k + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t) * stride_n;
     const float* center = mean + static_cast<size_t>(h) * HD;
     float a = 0.f;
 #pragma unroll
@@ -77,20 +77,20 @@ __global__ __launch_bounds__(kBlock) void quant_k_kernel(
     }
 }
 
-template <typename T>
+template <typename scalar_t>
 __global__ __launch_bounds__(HD) void vscale_kernel(
-    const T* __restrict__ v, float* __restrict__ vsc, int H, int T,
+    const scalar_t* __restrict__ v, float* __restrict__ vsc, int H, int T,
     int64_t stride_h, int64_t stride_n) {
     const int h = blockIdx.x, d = threadIdx.x;
-    const T* head = v + static_cast<int64_t>(h) * stride_h;
+    const scalar_t* head = v + static_cast<int64_t>(h) * stride_h;
     float a = 0.f;
     for (int t = 0; t < T; ++t) a = fmaxf(a, fabsf(static_cast<float>(head[static_cast<int64_t>(t) * stride_n + d])));
     vsc[static_cast<size_t>(h) * HD + d] = fmaxf(a / 127.f, 1e-8f);
 }
 
-template <typename T, int TT>
+template <typename scalar_t, int TT>
 __global__ __launch_bounds__(256) void vtranspose_kernel(
-    const T* __restrict__ v, const float* __restrict__ vsc, int8_t* __restrict__ vt,
+    const scalar_t* __restrict__ v, const float* __restrict__ vsc, int8_t* __restrict__ vt,
     int T, int Tp, int H, int64_t stride_h, int64_t stride_n) {
     constexpr int LD = HD + 16;
     __shared__ __attribute__((aligned(16))) int8_t tile[TT * LD];
@@ -99,7 +99,7 @@ __global__ __launch_bounds__(256) void vtranspose_kernel(
         const int t = idx / (HD / 16), c = (idx % (HD / 16)) * 16;
         __attribute__((aligned(16))) int8_t out[16];
         if (t0 + t < T) {
-            const T* src = v + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t0 + t) * stride_n + c;
+            const scalar_t* src = v + static_cast<int64_t>(h) * stride_h + static_cast<int64_t>(t0 + t) * stride_n + c;
 #pragma unroll
             for (int j = 0; j < 16; ++j) out[j] = q8(static_cast<float>(src[j]), 1.f / vsc[static_cast<size_t>(h) * HD + c + j]);
         } else {
@@ -125,20 +125,20 @@ __global__ __launch_bounds__(256) void vtranspose_kernel(
     }
 }
 
-template <typename T>
+template <typename scalar_t>
 void launch_qk(const void* q, void* qi, void* qs, const void* k, void* ki, void* ksb,
                void* mean, int H, int Tq, int Tk, int Tp, int64_t qh, int64_t qt,
                int64_t kh, int64_t kt, hipStream_t stream) {
-    kmean_kernel<T><<<H, HD, 0, stream>>>(static_cast<const T*>(k), static_cast<float*>(mean), H, Tk, kh, kt);
-    quant_q_kernel<T><<<dim3((Tq + kBlock - 1) / kBlock, H), kBlock, 0, stream>>>(static_cast<const T*>(q), static_cast<int8_t*>(qi), static_cast<float*>(qs), H, Tq, qh, qt);
-    quant_k_kernel<T><<<dim3((Tp + kBlock - 1) / kBlock, H), kBlock, 0, stream>>>(static_cast<const T*>(k), static_cast<const float*>(mean), static_cast<int8_t*>(ki), static_cast<float2*>(ksb), H, Tk, Tp, kh, kt);
+    kmean_kernel<scalar_t><<<H, HD, 0, stream>>>(static_cast<const scalar_t*>(k), static_cast<float*>(mean), H, Tk, kh, kt);
+    quant_q_kernel<scalar_t><<<dim3((Tq + kBlock - 1) / kBlock, H), kBlock, 0, stream>>>(static_cast<const scalar_t*>(q), static_cast<int8_t*>(qi), static_cast<float*>(qs), H, Tq, qh, qt);
+    quant_k_kernel<scalar_t><<<dim3((Tp + kBlock - 1) / kBlock, H), kBlock, 0, stream>>>(static_cast<const scalar_t*>(k), static_cast<const float*>(mean), static_cast<int8_t*>(ki), static_cast<float2*>(ksb), H, Tk, Tp, kh, kt);
 }
 
-template <typename T>
+template <typename scalar_t>
 void launch_v(const void* v, void* vt, void* vsc, int H, int T, int Tp,
               int64_t vh, int64_t vt_stride, hipStream_t stream) {
-    vscale_kernel<T><<<H, HD, 0, stream>>>(static_cast<const T*>(v), static_cast<float*>(vsc), H, T, vh, vt_stride);
-    vtranspose_kernel<T, 256><<<dim3((Tp + 255) / 256, H), 256, 0, stream>>>(static_cast<const T*>(v), static_cast<const float*>(vsc), static_cast<int8_t*>(vt), T, Tp, H, vh, vt_stride);
+    vscale_kernel<scalar_t><<<H, HD, 0, stream>>>(static_cast<const scalar_t*>(v), static_cast<float*>(vsc), H, T, vh, vt_stride);
+    vtranspose_kernel<scalar_t, 256><<<dim3((Tp + 255) / 256, H), 256, 0, stream>>>(static_cast<const scalar_t*>(v), static_cast<const float*>(vsc), static_cast<int8_t*>(vt), T, Tp, H, vh, vt_stride);
 }
 
 }  // namespace

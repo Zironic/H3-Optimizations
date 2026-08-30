@@ -405,6 +405,8 @@ the existing BF16 Triton backend after a cached full-route and genuinely sparse
 numerical self-test passes; failure continues through the existing fallback
 chain.
 
+Credit to Deluxa for the RDNA3+ Sol exact HIP kernel adapted by this branch.
+
 The branch ships prebuilt Linux x86-64 and Windows x64 libraries in
 `native/hip/bin`, compiled with ROCm 7.2.1 for the supported gfx11/gfx12 targets. Testers do
 not need CMake, a compiler, or the ROCm development SDK; they need only their
