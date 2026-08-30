@@ -6,3 +6,7 @@ native/build*/
 native/lib/
 native/selftest.json
 native/library_path.txt
+native/hip/build*/
+native/hip/lib/
+native/hip/selftest.json
+native/hip/library_path.txt

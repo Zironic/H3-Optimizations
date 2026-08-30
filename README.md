@@ -5,6 +5,11 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
+> **Experimental AMD branch:** On ROCm `gfx1200`/`gfx1201`, the normal H3 Sparse
+> Attention node tries the source-built AMD Sparse Kitchen INT8 backend first.
+> This path is intended for hardware testing and has not yet passed a live AMD
+> run. See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
+
 # How does it affect quality?
 
 You can see my test videos here 
@@ -389,6 +394,37 @@ The shipped CUDA targets are SM75, SM80, SM89, and SM120 on Windows, with SM90a
 also included on Linux. Each target ships real SASS and one SM89 PTX fallback is
 retained for forward compatibility.
 
+### Experimental AMD Sparse Kitchen
+
+This branch adapts Comfy Kitchen's experimental HIP INT8 attention to H3's
+64Q x 64KV sparse route. It is deliberately limited to RDNA 4 `gfx1200` and
+`gfx1201`; older AMD architectures continue through the existing sparse
+fallback chain.
+
+The branch contains source, not a prebuilt HIP library. Build it on the ROCm
+test system from the repository root:
+
+```text
+cmake -S native/hip -B native/hip/build -G Ninja
+cmake --build native/hip/build --config Release
+```
+
+The loader searches `native/hip/bin`, `native/hip/lib`, `native/hip/build`, and
+`native/hip/build/Release`. If the build emits the library elsewhere, place its
+absolute path in the ignored `native/hip/library_path.txt` file.
+
+With the library present, automatic sparse selection on supported AMD hardware
+tries AMD Sparse Kitchen before Sparse Sage, Triton, or FlexAttention. The first
+resolution runs a cached, per-device 100%-route numerical comparison against
+PyTorch attention. A failed build, unsupported architecture, or failed self-test
+retires AMD Sparse Kitchen and leaves the existing automatic fallback behavior
+in control. Explicitly selecting `Kitchen INT8` remains a hard requirement and
+reports the failure instead.
+
+This is an experimental tester branch. The HIP library has not been compiled or
+executed on AMD hardware in this checkout, so CPU tests here establish routing
+and interface behavior only.
+
 ### FROST BF16
 
 FROST BF16 is an explicit SM89-only 64Q x 64KV backend. It uses the packaged
@@ -486,6 +522,8 @@ overrides retain full-Q single-call behavior.
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
 - NVIDIA SM75 or newer for the shipped native Kitchen default
+- AMD RDNA 4 `gfx1200` or `gfx1201`, a ROCm PyTorch build, and a locally built
+  `native/hip` library for experimental AMD Sparse Kitchen
 - NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex path
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex

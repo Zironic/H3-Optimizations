@@ -29,6 +29,7 @@ class SourceIsolationTests(unittest.TestCase):
         # only at a sync and would otherwise appear later as an unrelated bug.
         exempt = {
             SOURCE / 'native' / 'selftest.py': ('torch.cuda.synchronize',),
+            SOURCE / 'native' / 'hip_selftest.py': ('torch.cuda.synchronize',),
         }
         for path in SOURCE.rglob('*.py'):
             text = path.read_text(encoding='utf-8')
