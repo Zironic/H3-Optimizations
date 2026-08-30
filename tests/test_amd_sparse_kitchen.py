@@ -1,4 +1,4 @@
-"""CPU/static contracts for the experimental gfx12 Sparse Kitchen branch."""
+"""CPU/static contracts for experimental gfx11/gfx12 Sparse Kitchen."""
 
 import hashlib
 import os
@@ -46,12 +46,13 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         return SimpleNamespace(
             IS_HIP_SPARSE_KITCHEN=True,
             SPARSE_GEOMETRIES=((64, 64),),
+            SUPPORTED_ARCHITECTURES=hip_int8_attention.SUPPORTED_ARCHITECTURES,
             __version__='experimental-test',
             device_architecture=lambda: architecture,
             int8_attention_is_available=lambda: available,
         )
 
-    def test_preflight_accepts_gfx12_without_nvidia_capability(self):
+    def test_preflight_accepts_gfx11_and_gfx12_without_nvidia_capability(self):
         cuda_probe = mock.Mock(side_effect=AssertionError('must not probe CUDA'))
         capability_probe = mock.Mock(
             side_effect=AssertionError('must not probe NVIDIA capability')
@@ -71,13 +72,23 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         cuda_probe.assert_not_called()
         capability_probe.assert_not_called()
 
-    def test_preflight_rejects_gfx11_and_failed_selftest(self):
-        with self.assertRaisesRegex(SparseKitchenError, 'gfx1200 or gfx1201'):
+        selected = preflight_sparse_kitchen(
+            cuda_available=cuda_probe,
+            capability_getter=capability_probe,
+            backend='rocm',
+            kitchen=self._hip_module('gfx1100'),
+            q_tile=64,
+            kv_tile=64,
+        )
+        self.assertEqual(selected.device_architecture(), 'gfx1100')
+
+    def test_preflight_rejects_rdna2_and_failed_selftest(self):
+        with self.assertRaisesRegex(SparseKitchenError, 'gfx11 or gfx12'):
             preflight_sparse_kitchen(
                 cuda_available=lambda: False,
                 capability_getter=lambda: None,
                 backend='rocm',
-                kitchen=self._hip_module('gfx1100'),
+                kitchen=self._hip_module('gfx1030'),
                 q_tile=64,
                 kv_tile=64,
             )
@@ -165,6 +176,7 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertNotIn('#error', header)
         self.assertIn('#if defined(__gfx1200__) || defined(__gfx1201__)', header)
+        self.assertIn('defined(__gfx1100__)', header)
 
     def test_prebuilt_libraries_match_manifests_and_target_both_gfx12_arches(self):
         binary_root = PACK / 'native' / 'hip' / 'bin'
@@ -192,20 +204,32 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(linux_bytes).hexdigest(), linux_info[4].split()[0])
         self.assertEqual(hashlib.sha256(windows_bytes).hexdigest(), windows_values['sha256'])
 
-    def test_vendored_kernel_is_bm64_with_indexed_kv_traversal(self):
+    def test_vendored_sol_exact_stage_walks_the_h3_route(self):
         source = (
             PACK / 'native' / 'hip' / 'src' / 'sage_attention' /
-            'int8_attn_sparse.hip'
+            'sol_exact_sparse.hip'
         ).read_text(encoding='utf-8')
-        long_kernel = source[
-            source.index('constexpr int kLongHeadDim'):
-            source.index('template <int HD, int CTA_K')
-        ]
-        self.assertIn('constexpr int kLongBlockM = 64;', long_kernel)
-        self.assertIn('constexpr int kLongWarps = 4;', long_kernel)
-        self.assertIn('for (int selected = 0; selected < selected_tiles; ++selected)', long_kernel)
-        self.assertIn('const int tile = route_row[selected];', long_kernel)
-        self.assertNotIn('for (int tile = 0; tile < tiles; ++tile)', long_kernel)
+        self.assertIn('constexpr int BQ = kBlock;', source)
+        self.assertIn('constexpr int NWAVE = BQ / 16;', source)
+        self.assertIn('for (int selected = 0; selected < nblocks; ++selected)', source)
+        self.assertIn('const int block = indices[selected];', source)
+        self.assertIn('float m = kNeg, l = 0.f;', source)
+        self.assertNotIn('launch_sol_route', source)
+
+    def test_sol_carriers_match_the_exact_stage_layout(self):
+        module = hip_int8_attention
+        self.assertEqual(module.HEAD_DIM, 128)
+        self.assertEqual(module.SPARSE_GEOMETRIES, ((64, 64),))
+        self.assertIn('gfx1100', module.SUPPORTED_ARCHITECTURES)
+        self.assertIn('gfx1201', module.SUPPORTED_ARCHITECTURES)
+        source = (
+            PACK / 'native' / 'hip' / 'src' / 'sage_attention' /
+            'sol_carriers.hip'
+        ).read_text(encoding='utf-8')
+        self.assertIn('kmean_kernel', source)
+        self.assertIn('quant_q_kernel', source)
+        self.assertIn('quant_k_kernel', source)
+        self.assertIn('vtranspose_kernel', source)
 
 
 if __name__ == '__main__':

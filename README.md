@@ -5,7 +5,7 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
-> **Experimental AMD branch:** On ROCm `gfx1200`/`gfx1201`, the normal H3 Sparse
+> **Experimental AMD branch:** On ROCm gfx11/gfx12 GPUs, the normal H3 Sparse
 > Attention node tries the shipped AMD Sparse Kitchen INT8 backend first.
 > This path is intended for hardware testing and has not yet passed a live AMD
 > run. See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
@@ -396,13 +396,14 @@ retained for forward compatibility.
 
 ### Experimental AMD Sparse Kitchen
 
-This branch adapts Comfy Kitchen's experimental HIP INT8 attention to H3's
-64Q x 64KV sparse route. It is deliberately limited to RDNA 4 `gfx1200` and
-`gfx1201`; older AMD architectures continue through the existing sparse
-fallback chain.
+This branch adapts the exact INT8 stage from Comfy Kitchen's HIP Sol-Attn work
+to H3's existing 64Q x 64KV sparse route. H3 still chooses every KV block; the
+Sol router, approximate tail, and fused QKV producer are not used. Supported
+targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4). RDNA 2 continues through the
+existing sparse fallback chain.
 
 The branch ships prebuilt Linux x86-64 and Windows x64 libraries in
-`native/hip/bin`, compiled with ROCm 7.2.1 for both gfx12 targets. Testers do
+`native/hip/bin`, compiled with ROCm 7.2.1 for the supported gfx11/gfx12 targets. Testers do
 not need CMake, a compiler, or the ROCm development SDK; they need only their
 normal ROCm ComfyUI runtime and a supported GPU.
 
@@ -422,7 +423,7 @@ requirement and reports the failure instead.
 
 This is an experimental tester branch. The shipped libraries have been compiled
 and ABI-export checked in CI on Ubuntu 24.04 and Windows Server 2022, but have
-not been executed on AMD hardware. A live `gfx1200` or `gfx1201` run is still
+not been executed on AMD hardware. A live gfx11 or gfx12 run is still
 required to establish numerical correctness and performance.
 
 ### FROST BF16
@@ -522,7 +523,7 @@ overrides retain full-Q single-call behavior.
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
 - NVIDIA SM75 or newer for the shipped native Kitchen default
-- AMD RDNA 4 `gfx1200` or `gfx1201` and a compatible ROCm PyTorch runtime for
+- AMD gfx11 (RDNA 3/3.5) or gfx12 (RDNA 4) and a compatible ROCm PyTorch runtime for
   the shipped experimental AMD Sparse Kitchen library
 - NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex path

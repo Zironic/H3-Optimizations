@@ -1,8 +1,9 @@
 # Experimental AMD Sparse Kitchen
 
-This backend adapts Comfy Kitchen's gfx12 INT8 attention for H3's 64Q x 64KV
-sparse route. It targets only `gfx1200` and `gfx1201` and has not yet been run
-on AMD hardware.
+This backend adapts Comfy Kitchen PR #143's HIP Sol-Attn exact stage and carrier
+layouts to H3's existing 64Q x 64KV route. It does not use Sol's router or
+approximate tail. The fat binaries target gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4);
+the H3 adaptation has not yet been run on AMD hardware.
 
 Prebuilt Linux x86-64 and Windows x64 libraries are shipped in `native/hip/bin`
 and rebuilt by the `Build experimental AMD Sparse Kitchen` workflow. No

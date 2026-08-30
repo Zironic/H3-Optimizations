@@ -1,4 +1,4 @@
-"""Experimental gfx12 64Q x 64KV Sparse Kitchen attention."""
+"""Experimental gfx11/gfx12 Sol exact Sparse Kitchen attention."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .. import diagnostics
 from . import hip_loader as loader
 
 
-__version__ = 'experimental-gfx12-bm64'
+__version__ = 'experimental-sol-exact-bm64'
 IS_HIP_SPARSE_KITCHEN = True
 KERNEL_ROUTE_ENCODING = 'absolute'
 OUTPUT_HND = 'hnd'
@@ -20,7 +20,11 @@ SPARSE_GEOMETRIES = ((64, 64),)
 Q_TILE = 64
 KV_TILE = 64
 HEAD_DIM = 128
-_SUPPORTED_ARCHITECTURES = ('gfx1200', 'gfx1201')
+SUPPORTED_ARCHITECTURES = (
+    'gfx1100', 'gfx1101', 'gfx1102', 'gfx1103',
+    'gfx1150', 'gfx1151', 'gfx1152', 'gfx1153',
+    'gfx1200', 'gfx1201',
+)
 _DTYPE_TO_CODE = {
     torch.float16: 1,
     torch.bfloat16: 2,
@@ -61,7 +65,7 @@ class PrequantizedInt8Attention:
     cta_k: int
     q_length: int
     kv_length: int
-    anchor_indices: torch.Tensor
+    k_mean: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -120,26 +124,25 @@ def prequantize_int8_attention(q, k, v, *, cta_k=KV_TILE):
     library = loader.load()
     _, heads, q_length, _ = q.shape
     kv_length = k.shape[-2]
-    padded_q = _pad_to(q_length, 128)
     padded_k = _pad_to(kv_length, KV_TILE)
     tiles = padded_k // KV_TILE
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty((1, heads, padded_k, HEAD_DIM), dtype=torch.int8, device=q.device)
     v_int8 = torch.empty(
-        (1, heads, tiles, HEAD_DIM, KV_TILE), dtype=torch.int8, device=q.device
+        (1, heads, HEAD_DIM, padded_k), dtype=torch.int8, device=q.device
     )
-    q_scale = torch.empty((1, heads, padded_q), dtype=torch.float32, device=q.device)
-    k_scale = torch.empty((1, heads, padded_k // 16), dtype=torch.float32, device=q.device)
-    v_scale = torch.empty((1, heads, tiles, HEAD_DIM), dtype=torch.float32, device=q.device)
-    anchor_indices = torch.empty((1, heads), dtype=torch.int32, device=q.device)
+    q_scale = torch.empty((1, heads, q_length), dtype=torch.float32, device=q.device)
+    k_scale = torch.empty((1, heads, padded_k, 2), dtype=torch.float32, device=q.device)
+    v_scale = torch.empty((1, heads, HEAD_DIM), dtype=torch.float32, device=q.device)
+    k_mean = torch.empty((1, heads, HEAD_DIM), dtype=torch.float32, device=q.device)
     stream = _stream(q.device)
     dtype_code = _DTYPE_TO_CODE[q.dtype]
     with diagnostics.stage('qk_carrier_pack'):
         loader.check(
             library.h3_hip_sparse_quantize_qk(
                 _ptr(q), _ptr(q_int8), _ptr(q_scale),
-                _ptr(k), _ptr(k_int8), _ptr(k_scale), _ptr(anchor_indices),
-                heads, q_length, kv_length, padded_q, padded_k,
+                _ptr(k), _ptr(k_int8), _ptr(k_scale), _ptr(k_mean),
+                heads, q_length, kv_length, q_length, padded_k,
                 q.stride(0), q.stride(1), q.stride(2),
                 k.stride(0), k.stride(1), k.stride(2),
                 dtype_code, stream,
@@ -168,7 +171,7 @@ def prequantize_int8_attention(q, k, v, *, cta_k=KV_TILE):
         cta_k=KV_TILE,
         q_length=q_length,
         kv_length=kv_length,
-        anchor_indices=anchor_indices,
+        k_mean=k_mean,
     )
 
 
@@ -265,7 +268,7 @@ def route_encoding():
 
 
 def int8_attention_is_available(device=None):
-    if device_architecture(device) not in _SUPPORTED_ARCHITECTURES:
+    if device_architecture(device) not in SUPPORTED_ARCHITECTURES:
         return False
     if not loader.is_available():
         return False

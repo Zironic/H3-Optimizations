@@ -14,6 +14,7 @@ permissions:
 
 env:
   ROCM_VERSION: '7.2.1'
+  H3_HIP_ARCHS: 'gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201'
 
 jobs:
   linux:
@@ -29,7 +30,7 @@ jobs:
           apt-get update
           apt-get install --yes --no-install-recommends cmake ninja-build binutils
 
-      - name: Build gfx1200 and gfx1201 library
+      - name: Build gfx11 and gfx12 library
         run: |
           cmake -S native/hip -B native/hip/build-ci -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -37,7 +38,7 @@ jobs:
             -DCMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++ \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DHIP_PLATFORM=amd \
-            '-DH3_HIP_ARCHS=gfx1200;gfx1201'
+            "-DH3_HIP_ARCHS=${H3_HIP_ARCHS}"
           cmake --build native/hip/build-ci --config Release
 
       - name: Verify and stage library
@@ -62,7 +63,7 @@ jobs:
             echo "source_sha=${GITHUB_SHA}"
             echo "rocm_version=${ROCM_VERSION}"
             echo "platform=linux-x86_64"
-            echo "architectures=gfx1200;gfx1201"
+            echo "architectures=${H3_HIP_ARCHS}"
             sha256sum native/hip/bin/libh3_hip_sparse_kitchen.so
           } > native/hip/bin/BUILD_INFO-linux.txt
 
@@ -105,7 +106,7 @@ jobs:
             "rocm[libraries,devel]==${ROCM_VERSION}"
           python -m rocm_sdk path --root
 
-      - name: Build gfx1200 and gfx1201 library
+      - name: Build gfx11 and gfx12 library
         shell: pwsh
         run: |
           $rocmRoot = (python -m rocm_sdk path --root).Trim()
@@ -119,7 +120,7 @@ jobs:
             "-DCMAKE_RC_COMPILER=$resourceCompiler" `
             "-DCMAKE_PREFIX_PATH=$rocmRoot" `
             -DHIP_PLATFORM=amd `
-            '-DH3_HIP_ARCHS=gfx1200;gfx1201'
+            "-DH3_HIP_ARCHS=$env:H3_HIP_ARCHS"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build native/hip/build-ci --config Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -150,7 +151,7 @@ jobs:
             "source_sha=$env:GITHUB_SHA",
             "rocm_version=$env:ROCM_VERSION",
             'platform=windows-x64',
-            'architectures=gfx1200;gfx1201',
+            "architectures=$env:H3_HIP_ARCHS",
             "sha256=$((Get-FileHash native\hip\bin\h3_hip_sparse_kitchen.dll -Algorithm SHA256).Hash.ToLowerInvariant())"
           ) | Set-Content -Encoding ascii native\hip\bin\BUILD_INFO-windows.txt
 

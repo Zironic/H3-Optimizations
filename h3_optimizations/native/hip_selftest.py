@@ -1,4 +1,4 @@
-"""Per-device numerical gate for experimental gfx12 Sparse Kitchen."""
+"""Per-device numerical gate for experimental gfx11/gfx12 Sparse Kitchen."""
 
 from __future__ import annotations
 

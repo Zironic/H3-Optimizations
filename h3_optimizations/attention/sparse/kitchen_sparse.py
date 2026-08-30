@@ -94,9 +94,10 @@ def preflight_sparse_kitchen(
         if backend not in (None, 'rocm'):
             raise SparseKitchenError('AMD Sparse Kitchen requires ROCm')
         architecture = module.device_architecture()
-        if architecture not in ('gfx1200', 'gfx1201'):
+        supported = getattr(module, 'SUPPORTED_ARCHITECTURES', ('gfx1200', 'gfx1201'))
+        if architecture not in supported:
             raise SparseKitchenError(
-                'AMD Sparse Kitchen requires gfx1200 or gfx1201; found %s'
+                'AMD Sparse Kitchen requires a supported gfx11 or gfx12 GPU; found %s'
                 % (architecture or 'unknown')
             )
         if not module.int8_attention_is_available():

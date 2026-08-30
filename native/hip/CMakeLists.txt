@@ -6,12 +6,12 @@ set(CMAKE_HIP_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT DEFINED H3_HIP_ARCHS)
-    set(H3_HIP_ARCHS "gfx1200;gfx1201")
+    set(H3_HIP_ARCHS "gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201")
 endif()
 foreach(arch IN LISTS H3_HIP_ARCHS)
-    if(NOT arch STREQUAL "gfx1200" AND NOT arch STREQUAL "gfx1201")
+    if(NOT arch MATCHES "^gfx(110[0-3]|115[0-3]|120[01])$")
         message(FATAL_ERROR
-            "Experimental H3 HIP Sparse Kitchen supports gfx1200/gfx1201; got ${arch}"
+            "Experimental H3 HIP Sparse Kitchen supports gfx11/gfx12 WMMA targets; got ${arch}"
         )
     endif()
 endforeach()
@@ -26,9 +26,8 @@ find_package(hip REQUIRED CONFIG)
 
 add_library(h3_hip_sparse_kitchen SHARED
     src/h3_hip_sparse_api.hip
-    src/sage_attention/int8_attn_sparse.hip
-    src/sage_attention/quant_qk_int8.hip
-    src/sage_attention/quant_v_int8.hip
+    src/sage_attention/sol_carriers.hip
+    src/sage_attention/sol_exact_sparse.hip
 )
 target_include_directories(h3_hip_sparse_kitchen PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -37,7 +36,7 @@ target_include_directories(h3_hip_sparse_kitchen PRIVATE
 target_compile_options(h3_hip_sparse_kitchen PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
 )
-set_source_files_properties(src/sage_attention/int8_attn_sparse.hip PROPERTIES
+set_source_files_properties(src/sage_attention/sol_exact_sparse.hip PROPERTIES
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:HIP>:-fno-fast-math>"
 )
 target_link_libraries(h3_hip_sparse_kitchen PRIVATE hip::host)

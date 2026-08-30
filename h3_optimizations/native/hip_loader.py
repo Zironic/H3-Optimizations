@@ -1,4 +1,4 @@
-"""Load the experimental gfx12 Sparse Kitchen HIP library through ctypes."""
+"""Load the experimental gfx11/gfx12 Sparse Kitchen HIP library through ctypes."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import threading
 import torch
 
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 _LIBRARY_NAMES = {
     'Linux': 'libh3_hip_sparse_kitchen.so',
     'Windows': 'h3_hip_sparse_kitchen.dll',
