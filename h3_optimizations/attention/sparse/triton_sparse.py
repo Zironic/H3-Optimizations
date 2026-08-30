@@ -1,10 +1,10 @@
 '''Stable public surface for the BF16 Triton sparse backend.
 
 The production backend keeps projected Q/K/V in BF16 and uses ordinary BF16
-tensor-core dots with FP32 online-softmax state at 64Q x 64KV. NVIDIA CUDA is
-the validated production target; matrix-capable ROCm GPUs are accepted as an
-experimental Triton target so AMD auto routing can try this backend before
-FlexAttention.
+dots with FP32 online-softmax state at 64Q x 64KV. NVIDIA CUDA is the validated
+production target. ROCm gfx103x uses a cached numerical gate before this
+backend becomes eligible; newer RDNA and known CDNA targets remain experimental
+Triton targets.
 '''
 
 import torch
@@ -25,6 +25,9 @@ TritonSparseSpec = TritonBF16Spec
 _ROCM_MATRIX_ARCHES = frozenset(
     ('gfx908', 'gfx90a', 'gfx940', 'gfx941', 'gfx942', 'gfx950')
 )
+_ROCM_RDNA2_ARCHES = frozenset(
+    ('gfx1030', 'gfx1031', 'gfx1032', 'gfx1033', 'gfx1034', 'gfx1035', 'gfx1036')
+)
 
 
 def _rocm_architecture():
@@ -38,7 +41,11 @@ def _rocm_architecture():
 
 def _rocm_bf16_dot_supported(architecture):
     architecture = str(architecture or '')
-    return architecture.startswith(('gfx11', 'gfx12')) or architecture in _ROCM_MATRIX_ARCHES
+    return (
+        architecture in _ROCM_RDNA2_ARCHES
+        or architecture.startswith(('gfx11', 'gfx12'))
+        or architecture in _ROCM_MATRIX_ARCHES
+    )
 
 
 def TritonSparseBackend(config=None, **kwargs):
@@ -53,16 +60,16 @@ def preflight_triton_sparse(
     *,
     rocm_available=None,
     rocm_arch_getter=None,
+    rocm_selftest=None,
     **kwargs,
 ):
     '''Validate the portable BF16 Triton fallback.
 
     ROCm exposes GPU tensors through PyTorch's ``cuda`` device type but does not
-    have an NVIDIA compute capability. The kernel itself is plain Triton, so on
-    ROCm require Triton plus a GPU family with a known matrix path and let first
-    real execution be the final hardware/stack validation boundary. RDNA1/2 and
-    unknown future architectures fail closed to the existing Flex/dense fallback
-    chain rather than being treated as validated enough for automatic selection.
+    have an NVIDIA compute capability. The kernel itself is plain Triton. RDNA2
+    may lower BF16 dots through a non-matrix fallback, so gfx103x must pass a
+    small per-device numerical check before automatic selection. Unknown future
+    architectures fail closed to the existing Flex/dense fallback chain.
     '''
     if rocm_available is None:
         rocm_available = lambda: bool(getattr(torch.version, 'hip', None))
@@ -78,10 +85,19 @@ def preflight_triton_sparse(
         )
         if not _rocm_bf16_dot_supported(architecture):
             raise TritonBF16Error(
-                'experimental ROCm BF16 Triton requires a matrix-capable AMD '
-                'GPU (gfx11/gfx12 or known CDNA); got %s'
+                'experimental ROCm BF16 Triton requires gfx103x, gfx11, gfx12, '
+                'or known CDNA; got %s'
                 % (architecture or 'unknown')
             )
+        if architecture in _ROCM_RDNA2_ARCHES:
+            if rocm_selftest is None:
+                from . import triton_bf16_selftest
+
+                rocm_selftest = triton_bf16_selftest.check
+            if not rocm_selftest():
+                raise TritonBF16Error(
+                    'experimental RDNA2 BF16 Triton numerical self-test failed'
+                )
         return TritonBF16Spec()
     return preflight_triton_bf16(**kwargs)
 

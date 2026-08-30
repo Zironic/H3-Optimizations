@@ -6,7 +6,8 @@ The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
 > **Experimental AMD branch:** On ROCm gfx11/gfx12 GPUs, the normal H3 Sparse
-> Attention node tries the shipped AMD Sparse Kitchen INT8 backend first.
+> Attention node tries the shipped AMD Sparse Kitchen INT8 backend first. On
+> RDNA 2 gfx103x it tries BF16 Triton after a numerical self-test.
 > This path is intended for hardware testing and has not yet passed a live AMD
 > run. See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
 
@@ -399,8 +400,10 @@ retained for forward compatibility.
 This branch adapts the exact INT8 stage from Comfy Kitchen's HIP Sol-Attn work
 to H3's existing 64Q x 64KV sparse route. H3 still chooses every KV block; the
 Sol router, approximate tail, and fused QKV producer are not used. Supported
-targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4). RDNA 2 continues through the
-existing sparse fallback chain.
+targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4). RDNA 2 gfx103x instead uses
+the existing BF16 Triton backend after a cached full-route and genuinely sparse
+numerical self-test passes; failure continues through the existing fallback
+chain.
 
 The branch ships prebuilt Linux x86-64 and Windows x64 libraries in
 `native/hip/bin`, compiled with ROCm 7.2.1 for the supported gfx11/gfx12 targets. Testers do
@@ -448,7 +451,8 @@ The package BF16 Triton backend is available on supported Triton runtimes and
 uses the same 64Q x 64KV routing geometry as the native Kitchen default. It can
 stream projection chunks from supported BF16, ConvRot-256, W4A8, and FP8
 checkpoints into its BF16 attention carrier without retaining a full fused
-projection temporary.
+projection temporary. On ROCm RDNA 2 gfx103x this is the experimental automatic
+default, gated by a cached numerical comparison against PyTorch attention.
 
 ### FlexAttention
 
@@ -525,7 +529,8 @@ overrides retain full-Q single-call behavior.
 - NVIDIA SM75 or newer for the shipped native Kitchen default
 - AMD gfx11 (RDNA 3/3.5) or gfx12 (RDNA 4) and a compatible ROCm PyTorch runtime for
   the shipped experimental AMD Sparse Kitchen library
-- NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback
+- NVIDIA SM80 or newer, or AMD RDNA 2 gfx103x, with Triton for the BF16 Triton
+  sparse fallback
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex path
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex
   path
