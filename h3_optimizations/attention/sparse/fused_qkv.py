@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import itertools
+import typing
 import weakref
 
 import torch
@@ -605,7 +606,7 @@ def fused_qkv_op(
     heads: int,
     epsilon: float,
     has_rope: bool,
-    rope_strides: list[int],
+    rope_strides: typing.List[int],
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -674,7 +675,7 @@ def fused_qkv_module_op(
     heads: int,
     epsilon: float,
     has_rope: bool,
-    rope_strides: list[int],
+    rope_strides: typing.List[int],
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
