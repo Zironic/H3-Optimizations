@@ -294,7 +294,7 @@ class FinalLayerTests(unittest.TestCase):
             final_layer.install(patcher, 3)
         patcher.patch_model(load_weights=False)
         x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
-        with mock.patch.object(final_layer.logging, 'info') as info:
+        with mock.patch.object(final_layer.logging, 'debug') as debug:
             root.diffusion_model.final_layer(
                 x,
                 None,
@@ -306,8 +306,8 @@ class FinalLayerTests(unittest.TestCase):
             )
         patcher.unpatch_model(unpatch_weights=False)
 
-        self.assertEqual(len(info.call_args_list), 1)
-        self.assertIn('chunked FinalLayer ran', info.call_args.args[0])
+        self.assertEqual(len(debug.call_args_list), 1)
+        self.assertIn('chunked FinalLayer ran', debug.call_args.args[0])
 
     def test_memory_plan_installs_final_layer_even_when_mlp_is_off(self):
         patcher = _Patcher()
@@ -370,10 +370,10 @@ class FinalLayerExecutionLogTests(unittest.TestCase):
         layer = _Layer()
         forward = final_layer.make_forward(layer, chunk_rows)
         x = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
-        with mock.patch.object(final_layer.logging, 'info') as info:
+        with mock.patch.object(final_layer.logging, 'debug') as debug:
             for _ in range(calls):
                 forward(x, None, *segments)
-        return [call.args for call in info.call_args_list]
+        return [call.args for call in debug.call_args_list]
 
     def test_first_execution_logs_once(self):
         logged = self._run(3, ((0, 7, 0), (7, 11, 1)))

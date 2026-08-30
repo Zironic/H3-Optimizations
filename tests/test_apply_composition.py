@@ -1,6 +1,7 @@
 '''Apply-plan composition through Memory then Sparse and the reverse.'''
 
 from copy import deepcopy
+import logging
 import os
 from pathlib import Path
 import sys
@@ -350,7 +351,7 @@ class ApplyCompositionTests(unittest.TestCase):
         qkv = QKVProviderResolution(
             'standard_h3_qkv',
             False,
-            'synthetic',
+            'Comfy Kitchen external producer API is unavailable',
         )
         mlp = MLPProviderResolution(
             'generic_chunked_quantized',
@@ -412,7 +413,7 @@ class ApplyCompositionTests(unittest.TestCase):
             '_ensure_sparse_runtime',
             return_value=(object(), True),
         ):
-            with self.assertNoLogs(level='INFO'):
+            with self.assertLogs(level='DEBUG') as provisional_logs:
                 memory_only = apply_module.apply_plan(
                     FakeModel(),
                     H3OptimizationPlan(memory=memory),
@@ -423,8 +424,18 @@ class ApplyCompositionTests(unittest.TestCase):
                 )
                 left = apply_in_order(FakeModel(), memory, sparse)
                 right = apply_in_order(FakeModel(), sparse, memory)
+                apply_module._reconcile_plan(
+                    left,
+                    read_plan(left),
+                    phase='clone',
+                    force_rebuild=True,
+                )
 
-            with self.assertLogs(level='INFO') as logs:
+            self.assertFalse(any(
+                record.levelno >= logging.INFO
+                for record in provisional_logs.records
+            ))
+            with self.assertLogs(level='DEBUG') as logs:
                 run_prepare_wrappers(memory_only)
                 run_prepare_wrappers(sparse_only)
                 run_prepare_wrappers(left)
@@ -435,15 +446,34 @@ class ApplyCompositionTests(unittest.TestCase):
         ]
         self.assertEqual(len(applied_logs), 4)
         self.assertTrue(all('phase=prepare' in line for line in applied_logs))
+        self.assertTrue(all(line.startswith('DEBUG:') for line in applied_logs))
+        final_logs = [
+            line for line in logs.output if ' final plan: ' in line
+        ]
+        self.assertEqual(len(final_logs), 4)
+        self.assertTrue(all(line.startswith('INFO:') for line in final_logs))
         self.assertEqual(sum(
-            'features=memory ' in line for line in applied_logs
+            'final plan: Memory Optimization; attention: Comfy Kitchen INT8.'
+            in line for line in final_logs
         ), 1)
         self.assertEqual(sum(
-            'features=sparse ' in line for line in applied_logs
+            'final plan: Sparse Attention; attention: Sparse Sage.'
+            in line for line in final_logs
         ), 1)
         self.assertEqual(sum(
-            'features=memory+sparse ' in line for line in applied_logs
+            'final plan: Memory Optimization + Sparse Attention; '
+            'attention: Sparse Sage.' in line for line in final_logs
         ), 2)
+        self.assertFalse(any('qkv_provider=' in line for line in final_logs))
+        warning_logs = [
+            record.getMessage()
+            for record in logs.records
+            if record.levelno == logging.WARNING
+        ]
+        self.assertEqual(len(warning_logs), 4)
+        self.assertTrue(all(
+            'FUSED QKV IS NOT RUNNING' in line for line in warning_logs
+        ))
         self.assertTrue(all(
             'qkv_weights=TensorWiseINT8Layout+convrot256 qkv_layers=50' in line
             for line in applied_logs

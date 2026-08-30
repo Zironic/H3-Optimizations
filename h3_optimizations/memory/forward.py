@@ -154,7 +154,7 @@ def _log_mlp_fallback(layer_index, reason):
     reason = str(reason)
     if reason in _MLP_FALLBACK_LOGGED:
         return
-    logging.info(
+    logging.debug(
         '%s preferred MLP optimization is unavailable for this model path '
         '(first seen in block %d); using a compatible fallback instead. '
         'Output is unaffected, but VRAM use or speed may be slightly worse. '

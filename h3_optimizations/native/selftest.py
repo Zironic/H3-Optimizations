@@ -334,7 +334,7 @@ def _load_result(device=None, *, force=False):
                 if not ok
             ]
             if failed:
-                logging.info(
+                logging.debug(
                     '%s native sparse self-test disabled geometry %s on %s; '
                     'a validated fallback geometry remains available.',
                     LOG_PREFIX,

@@ -52,7 +52,7 @@ def _prepare(self, q, k, v, *, layer_index, transformer_options):
 
     stats.observe_sequence(sequence)
     if not self._logged:
-        logging.info(
+        logging.debug(
             "[H3 attention] sage_mem_eff active: SageAttention %s, HND, "
             "per-thread int64 Q/K, deferred stock FP8 V, accumulation=%s, "
             "kernel=%s via %s",

@@ -195,9 +195,21 @@ want automatic backend selection.
 
 MiniMax H3 text-to-video at 1376x768 (1.0 MP, 16:9) on an RTX 4070 12 GB,
 `res_multistep`/`simple`, measured end to end through a real sampler. Each cell
-executes five sampler steps and reports the median of the four step times after
-the first; step 1 carries model initialization and is excluded. The 20-step
-columns are projections from that median, not separate wall-clock runs.
+executes five sampler steps and reports the median of the last three; step 1
+carries model initialization and the step after it is a discarded warmup. The
+20-step columns are projections from that median, not separate wall-clock runs.
+
+The card was capped to **160 W** of its 200 W stock board power for these runs,
+which is quieter and holds a steadier clock than the stock limit. A stock-power
+card is faster than every row below, but not uniformly: the cap costs each
+configuration in proportion to how power-saturated it already was, and dense
+INT8 attention at 10 seconds is the most saturated cell in the matrix. The
+Comfy Kitchen baseline is therefore the row that transfers least well to a
+stock-power card, and the speedups below are, if anything, flattered by it.
+
+Benchmark-only synthetic Qwen states and an empty native latent stand in for
+the text encoder and VAE, so neither is loaded and neither contributes to the
+timings or the memory figures.
 
 Every benchmark arm also shares two controls that are **not normal user
 settings**:
@@ -212,33 +224,53 @@ Both benchmark controls come from the benchmark setup; the first is provided by
 the sibling H3-Extended pack. They should not be interpreted as recommended
 workflow settings.
 
-| configuration | 5s step | 5s 20-step | 5s peak VRAM | 10s step | 10s 20-step | 10s peak VRAM |
+The VRAM columns are the **ComfyUI process's own dedicated GPU memory**, read
+from the Windows GPU Process Memory counters that Task Manager reports. This
+replaces the whole-GPU `nvidia-smi` figure used in earlier revisions of this
+table, which carried the desktop compositor and every other application on the
+card. That baseline is not a constant: measured here it sat near 2.9 GB during
+the 5-second arms and collapsed to roughly 1.0 GB during the 10-second ones, as
+Windows evicted desktop surfaces under pressure. Whole-GPU peaks from the two
+durations were therefore never comparable with each other. Arm-to-arm
+differences within one duration were much less affected, since the baseline
+largely cancels.
+
+| configuration | 5s step | 5s 20-step | 5s VRAM | 10s step | 10s 20-step | 10s VRAM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Comfy Kitchen INT8 dense | 26.7 s | ~8m55s | 7513 MiB | 72.2 s | ~24m05s | 11729 MiB |
-| SageAttention dense | 26.5 s | ~8m50s | 7754 MiB | out of memory | - | - |
-| SageAttention + chunked QKV/MLP/FinalLayer (streaming off) | 26.2 s | ~8m44s | 5901 MiB | 76.1 s | ~25m22s | 9047 MiB |
-| H3 Memory Optimization + Sparse Attention (KV 100%) | 28.9 s | ~9m39s | 5355 MiB | 86.3 s | ~28m45s | 7315 MiB |
-| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **17.0 s** | **~5m41s** | **5295 MiB** | **42.7 s** | **~14m14s** | **7324 MiB** |
+| Comfy Kitchen INT8 dense | 28.2 s | ~9m24s | 6193 MiB | 89.0 s | ~29m40s | 10849 MiB |
+| SageAttention dense | 27.7 s | ~9m13s | 6737 MiB | out of memory | - | - |
+| SageAttention + streamed QKV, chunked MLP/FinalLayer | 28.0 s | ~9m19s | 2801 MiB | 77.9 s | ~25m58s | 4787 MiB |
+| H3 Memory Optimization + Sparse Attention (KV 100%) | 29.5 s | ~9m50s | 2963 MiB | 91.5 s | ~30m30s | 4595 MiB |
+| **H3 Memory Optimization + Sparse Attention (KV 30%, measured)** | **18.7 s** | **~6m14s** | **2963 MiB** | **46.1 s** | **~15m21s** | **4563 MiB** |
 
 Against dense Comfy Kitchen attention, the measured 30% configuration achieved
-**1.57x faster at 5 seconds and 1.69x at 10 seconds**, using 2.2 GB less VRAM at
-5 seconds and 4.4 GB less at 10 seconds.
+**1.51x faster at 5 seconds and 1.93x at 10 seconds**, using 3.2 GB less VRAM at
+5 seconds and 6.1 GB less at 10 seconds.
 
 These measurements predate the 15% middle-step and 50% early-step defaults; they
 should not be read as performance evidence for the new schedule.
 
 The rows isolate successive **conceptual optimization stages**, but they are not
-a ladder of untouched UI defaults. In particular, the Sage memory arm uses
-`Precision = Preserve native` and `QKV streaming = Off`, while the following
-100% KV arm enables streamed QKV and uses the normal automatic precision policy.
-The stage comparison is therefore:
+a ladder of untouched UI defaults. The Sage memory arm pins
+`Precision = Preserve native`, while the following 100% KV arm uses the normal
+automatic precision policy. Both leave `QKV streaming = Auto`, and both stream:
+the Sage memory arm projects ConvRot INT8 QKV straight into the dense Sage
+carrier (`streamed_dense_sage_qkv`), which the benchmark verifies per arm with a
+route assertion. Streaming is therefore not what separates those two rows; the
+attention path and the precision policy are. The stage comparison is:
 
 | conceptual stage | 5s speed | 5s VRAM |
 | --- | ---: | ---: |
-| Comfy Kitchen dense to dense SageAttention | 1.01x | +241 MiB |
-| add chunked QKV, MLP and FinalLayer while streaming remains off | 1.01x | -1853 MiB |
-| add streamed QKV and the native 64Q x 64KV attention path at 100% KV | 0.91x | -546 MiB |
-| reduce video KV density to 30 percent | 1.70x | -60 MiB |
+| Comfy Kitchen dense to dense SageAttention | 1.02x | +544 MiB |
+| stream ConvRot INT8 QKV into the dense Sage carrier, chunk MLP and FinalLayer | 0.99x | -3936 MiB |
+| swap that carrier for the native 64Q x 64KV path at 100% KV, precision on the automatic policy | 0.95x | +162 MiB |
+| reduce video KV density to 30 percent | 1.58x | +0 MiB |
+
+The native 64Q x 64KV path costs 162 MiB at 5 seconds rather than saving memory,
+and pays it back at 10 seconds, where it sits below the dense Sage carrier
+(4595 MiB against 4787 MiB, and 4563 MiB once KV drops to 30%). Dense Sage with
+streamed QKV is the more memory-efficient choice until the sequence grows long
+enough to invert that.
 
 The measurements were taken with the NVIDIA driver's CUDA sysmem fallback
 disabled, so exceeding VRAM fails instead of silently paging to system memory.

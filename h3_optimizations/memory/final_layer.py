@@ -147,7 +147,7 @@ def make_forward(layer, chunk_rows):
             announced.append(True)
             video_rows = int(video_seg[1]) - int(video_seg[0])
             audio_rows = int(audio_seg[1]) - int(audio_seg[0])
-            logging.info(
+            logging.debug(
                 '[H3 Optimizations] chunked FinalLayer ran: %d rows, '
                 'video %d in %d chunk(s), audio %d in %d chunk(s), '
                 'chunk_rows=%d',

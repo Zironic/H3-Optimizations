@@ -551,7 +551,7 @@ class ArchitectureBackend:
     def log_once(self, version, detail):
         if self._logged:
             return
-        logging.info(
+        logging.debug(
             "%s %s active: SageAttention %s, %s",
             LOG_PREFIX,
             self.name,

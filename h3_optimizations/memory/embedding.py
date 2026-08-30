@@ -176,7 +176,7 @@ def make_forward(model, original_forward):
         del text_states
         if not announced:
             announced.append(True)
-            logging.info(
+            logging.debug(
                 '[H3 Optimizations] released dead embedding tensors before block 0: rows=%d',
                 int(h.shape[0]),
             )

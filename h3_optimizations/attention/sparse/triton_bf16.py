@@ -541,7 +541,7 @@ class TritonBF16Backend:
                 )
                 if not self._streamed_q_announced:
                     self._streamed_q_announced = True
-                    logging.info(
+                    logging.debug(
                         '[H3 Optimizations] streamed BF16 Triton ran: '
                         'global K/V, aliased Q/output slab, chunk_rows=%d',
                         int(prepared.metadata['query_chunk_rows']),

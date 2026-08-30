@@ -345,7 +345,7 @@ class FrostBF16Backend:
             result = execute_streamed_frost_bf16(module, self, prepared)
             if not self._streamed_q_announced:
                 self._streamed_q_announced = True
-                logging.info(
+                logging.debug(
                     '[H3 Optimizations] streamed FROST BF16 ran: '
                     'global sequence-major K/V, bounded Q/output, chunk_rows=%d',
                     int(prepared.metadata['query_chunk_rows']),

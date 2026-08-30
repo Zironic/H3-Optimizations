@@ -286,7 +286,7 @@ def install():
     _original = current
     per_thread_int8_i64._h3_optimizations_int64 = True
     sage_core.per_thread_int8_triton = per_thread_int8_i64
-    logging.info("[H3 attention] int64 Q/K quantizer installed "
+    logging.debug("[H3 attention] int64 Q/K quantizer installed "
                  "(stock kernels wrap from row %d at H3's 21504 stride)",
                  first_wrapping_row(56 * 128 * 3))
     return True

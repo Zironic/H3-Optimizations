@@ -70,22 +70,22 @@ class _FakePatcher:
 
 
 class LoggingNoiseTests(unittest.TestCase):
-    def test_mlp_fallback_is_info_once_per_reason(self):
+    def test_mlp_fallback_is_debug_once_per_reason(self):
         reason = 'test incompatible optimized MLP format'
         forward_module._MLP_FALLBACK_LOGGED.discard(reason)
 
-        with patch.object(forward_module.logging, 'info') as info:
+        with patch.object(forward_module.logging, 'debug') as debug:
             forward_module._log_mlp_fallback(3, reason)
             forward_module._log_mlp_fallback(17, reason)
             forward_module._log_mlp_fallback(3, reason)
 
-        self.assertEqual(info.call_count, 1)
-        args = info.call_args.args
+        self.assertEqual(debug.call_count, 1)
+        args = debug.call_args.args
         self.assertIn('preferred MLP optimization is unavailable', args[0])
         self.assertEqual(args[2], 3)
         self.assertEqual(args[3], reason)
 
-    def test_partial_native_geometry_failure_is_info_with_debug_detail(self):
+    def test_partial_native_geometry_failure_is_debug_only(self):
         detail = {
             'dense_int8_passed': True,
             'production_sparse_passed': True,
@@ -113,10 +113,17 @@ class LoggingNoiseTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertTrue(actual['passed'])
         warning.assert_not_called()
-        info.assert_called_once()
-        self.assertIn('validated fallback geometry remains available', info.call_args.args[0])
-        debug.assert_called_once()
-        self.assertIn('native sparse self-test detail', debug.call_args.args[0])
+        info.assert_not_called()
+        self.assertEqual(debug.call_count, 2)
+        messages = [call.args[0] for call in debug.call_args_list]
+        self.assertTrue(any(
+            'validated fallback geometry remains available' in message
+            for message in messages
+        ))
+        self.assertTrue(any(
+            'native sparse self-test detail' in message
+            for message in messages
+        ))
 
     def test_full_native_selftest_failure_stays_warning(self):
         detail = {

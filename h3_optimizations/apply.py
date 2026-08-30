@@ -39,6 +39,7 @@ from .attention.sparse.kitchen_sparse import (
     preflight_sparse_kitchen,
 )
 from .dense_resolver import (
+    ATTENTION_COMFY_KITCHEN_INT8,
     ATTENTION_EXISTING_FULL_Q,
     ATTENTION_SAGE_PREFIX,
     ATTENTION_SAGE_SM89,
@@ -156,9 +157,19 @@ _BOUNDED_QKV_PROVIDERS = (
 )
 
 
-def _reconciliation_log_level(phase):
-    '''Only the final prepare-time reconciliation is user-facing at INFO.'''
-    return logging.INFO if phase == 'prepare' else logging.DEBUG
+def _attention_summary_name(attention):
+    selected = attention.selected
+    if selected.startswith(ATTENTION_SAGE_PREFIX):
+        return 'Dense Sage'
+    return {
+        ATTENTION_COMFY_KITCHEN_INT8: 'Comfy Kitchen INT8',
+        ATTENTION_EXISTING: 'existing ComfyUI attention',
+        ATTENTION_SPARSE: 'Sparse Sage',
+        ATTENTION_TRITON_SPARSE: 'BF16 Triton Sparse',
+        ATTENTION_FP8_FLEX: 'FP8 FlexAttention',
+        ATTENTION_FROST_BF16: 'FROST BF16',
+        ATTENTION_KITCHEN_SPARSE: 'Comfy Kitchen INT8 Sparse',
+    }.get(selected, selected.replace('_', ' '))
 
 
 def _effective_qkv_chunk_rows(chunk_rows):
@@ -1415,7 +1426,6 @@ def _reconcile_plan(
         ),
     }
     _install_composition_hooks(patched)
-    _warn_about_slow_paths(attention, qkv)
     qkv_labels = inventory.labels('qkv')
     features = '+'.join(
         name
@@ -1436,8 +1446,7 @@ def _reconcile_plan(
         and previous_attention != attention_name
         else ''
     )
-    logging.log(
-        _reconciliation_log_level(phase),
+    logging.debug(
         '%s applied plan: phase=%s features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s embedding=%s memory=%s device=%s',
         LOG_PREFIX,
         phase,
@@ -1460,6 +1469,22 @@ def _reconcile_plan(
         describe_memory_options(attention),
         environment.device_name,
     )
+    if phase == 'prepare':
+        feature_summary = ' + '.join(
+            label
+            for label, request in (
+                ('Memory Optimization', plan.memory),
+                ('Sparse Attention', plan.sparse),
+            )
+            if request is not None
+        ) or 'no H3 optimizations'
+        logging.info(
+            '%s final plan: %s; attention: %s.',
+            LOG_PREFIX,
+            feature_summary,
+            _attention_summary_name(attention),
+        )
+        _warn_about_slow_paths(attention, qkv)
     return patched
 
 

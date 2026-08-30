@@ -91,7 +91,7 @@ class ProjectedSM89SageBackend:
 
         stats.observe_sequence(projected.sequence)
         if not self._projected_logged:
-            logging.info(
+            logging.debug(
                 "[H3 attention] sage_mem_eff projected QKV active: "
                 "SageAttention %s, per-thread INT8 Q/K, fused projection, "
                 "accumulation=%s, kernel=%s via %s",

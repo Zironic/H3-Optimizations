@@ -62,7 +62,7 @@ def _verify(selftest):
     if not selftest.check():
         # selftest.check already logged what failed and why.
         return False
-    logging.info('%s native backend ready (%s)', LOG_PREFIX, describe())
+    logging.debug('%s native backend ready (%s)', LOG_PREFIX, describe())
     return True
 
 
