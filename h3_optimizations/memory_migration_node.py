@@ -361,11 +361,12 @@ class H3MemoryOptimization(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, precision_mode, chunk_rows=DEFAULT_CHUNK_ROWS):
-        try:
-            _normalize_precision_mode(precision_mode)
-        except ValueError as exc:
-            return str(exc)
-        if (
+        if precision_mode is not None:
+            try:
+                _normalize_precision_mode(precision_mode)
+            except ValueError as exc:
+                return str(exc)
+        if chunk_rows is not None and (
             isinstance(chunk_rows, bool)
             or int(chunk_rows) != chunk_rows
             or int(chunk_rows) <= 0
