@@ -110,7 +110,7 @@ jobs:
         run: |
           $rocmRoot = (python -m rocm_sdk path --root).Trim()
           $compiler = Join-Path $rocmRoot 'lib\llvm\bin\clang++.exe'
-          $resourceCompiler = (Get-Command rc.exe).Source
+          $resourceCompiler = (Get-Command rc.exe).Source.Replace('\', '/')
           cmake -S native/hip -B native/hip/build-ci -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             "-DCMAKE_C_COMPILER=$compiler" `
