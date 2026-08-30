@@ -29,6 +29,7 @@ from h3_optimizations.attention.sparse.kitchen_sparse import (  # noqa: E402
     preflight_sparse_kitchen,
 )
 from h3_optimizations.native import hip_int8_attention  # noqa: E402
+from h3_optimizations.native import hip_selftest  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
     SparseRequest,
@@ -145,6 +146,24 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         converted = route.for_kernel()
         self.assertEqual(converted.encoding, 'absolute')
         self.assertEqual(converted.indices.tolist(), [[[[2, 5, 6, 0]]]])
+
+    def test_hardware_selftest_route_is_sparse_varied_and_includes_tail(self):
+        rows = hip_selftest._sparse_absolute_rows(4, 11, 11)
+
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(len(row) == 5 for head in rows for row in head))
+        self.assertTrue(all(row == sorted(set(row)) for head in rows for row in head))
+        self.assertTrue(all(row[0] == 0 and row[-1] == 10 for head in rows for row in head))
+        self.assertNotEqual(rows[0][0], rows[0][1])
+        self.assertNotEqual(rows[0][0], rows[1][0])
+        self.assertEqual(hip_selftest._delta_rows([[[0, 2, 5, 7, 10]]]), [[[0, 2, 3, 2, 3]]])
+
+    def test_architecture_header_allows_the_hip_clang_host_pass(self):
+        header = (
+            PACK / 'native' / 'hip' / 'src' / 'architecture_config.h'
+        ).read_text(encoding='utf-8')
+        self.assertNotIn('#error', header)
+        self.assertIn('#if defined(__gfx1200__) || defined(__gfx1201__)', header)
 
     def test_vendored_kernel_is_bm64_with_indexed_kv_traversal(self):
         source = (
