@@ -126,8 +126,8 @@ EARLY_SCHEDULE_OPTIONS = (
 
 def _validate_sparse_budget(name, value):
     budget = float(value)
-    if not math.isfinite(budget) or not 0.01 <= budget <= 1.0:
-        raise ValueError('%s must be finite and in [0.01, 1]' % name)
+    if not math.isfinite(budget):
+        raise ValueError('%s must be finite' % name)
 
 
 def _validate_edge_schedule(early_steps, early_kv, late_steps, late_kv):
@@ -197,15 +197,12 @@ class MemoryRequest:
                 'unknown attention V memory request %r' % self.attention_v_memory
             )
         chunk_rows = int(self.chunk_rows)
-        if not MIN_CHUNK_ROWS <= chunk_rows <= MAX_CHUNK_ROWS:
-            raise ValueError(
-                'chunk_rows must be between %d and %d'
-                % (MIN_CHUNK_ROWS, MAX_CHUNK_ROWS)
-            )
-        if chunk_rows % CHUNK_ALIGNMENT:
-            raise ValueError(
-                'chunk_rows must be a multiple of %d' % CHUNK_ALIGNMENT
-            )
+        if (
+            isinstance(self.chunk_rows, bool)
+            or chunk_rows != self.chunk_rows
+            or chunk_rows <= 0
+        ):
+            raise ValueError('chunk_rows must be a positive integer')
 
     @property
     def signature(self):

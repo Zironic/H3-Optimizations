@@ -1,5 +1,7 @@
 '''CPU tests for fixed-density Sparse Sage routing.'''
 
+import math
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -7,16 +9,28 @@ import unittest
 
 import torch
 
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
+
 PACK = Path(__file__).resolve().parents[1]
 ROOT = PACK.parents[1]
 sys.path.insert(0, str(PACK))
 sys.path.insert(0, str(ROOT))
+TEST_ARGS = sys.argv[1:]
+sys.argv = [sys.argv[0], '--cpu']
+
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
 
 from h3_optimizations.attention.sparse.router import SparseTileRouter  # noqa: E402
 from h3_optimizations.attention.sparse.config import (  # noqa: E402
     HybridSparseConfig,
     resolve_video_budget,
 )
+
+sys.argv = [sys.argv[0], *TEST_ARGS]
+
+
 def layout(sequence=384, video_start=128):
     return SimpleNamespace(
         seq_len=sequence,
@@ -138,6 +152,31 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(decode(lut, valid).all())
         self.assertEqual(metadata.full_mask_density, 1.0)
         self.assertEqual(metadata.sparse_q_tiles, 0)
+
+    def test_finite_budgets_outside_the_ui_range_saturate(self):
+        q, k = routed_inputs()
+        router = SparseTileRouter()
+        _lut, _valid, sparse = router.build_lut(q, k, layout(), -1.0)
+        lut, valid, dense = router.build_lut(q, k, layout(), 1.2)
+
+        self.assertEqual(sparse.requested_video_budget, -1.0)
+        self.assertEqual(sparse.retained_video_kv_tiles, 1)
+        self.assertEqual(dense.requested_video_budget, 1.2)
+        self.assertEqual(dense.retained_video_kv_tiles, 4)
+        self.assertTrue(decode(lut, valid).all())
+        self.assertEqual(router._retained(-1e308, router.geometry(layout())), 1)
+        self.assertEqual(router._retained(1e308, router.geometry(layout())), 4)
+
+        HybridSparseConfig(
+            video_budget=-1.0,
+            early_steps=1001,
+            early_kv=1.2,
+            late_steps=2000,
+            late_kv=0.0,
+        )
+        for value in (math.inf, -math.inf, math.nan):
+            with self.assertRaisesRegex(ValueError, 'finite'):
+                HybridSparseConfig(video_budget=value)
 
 if __name__ == '__main__':
     unittest.main()

@@ -142,6 +142,33 @@ class NodeTests(unittest.TestCase):
             ),
             str,
         )
+        self.assertTrue(H3SparseAttention.validate_inputs(0.0))
+        self.assertTrue(H3SparseAttention.validate_inputs(1.2))
+        self.assertIsInstance(H3SparseAttention.validate_inputs(float('nan')), str)
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8',
+                video_budget=-1.0,
+                early_steps=1001,
+                early_kv=1.2,
+                late_steps=2000,
+                late_kv=0.0,
+            )
+        )
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8',
+                early_steps=-1,
+            ),
+            str,
+        )
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8',
+                late_kv=float('inf'),
+            ),
+            str,
+        )
         self.assertEqual(input_by_id(advanced, 'video_budget').default, 0.15)
         self.assertEqual(input_by_id(advanced, 'early_steps').default, 4)
         self.assertEqual(input_by_id(advanced, 'early_kv').default, 0.5)

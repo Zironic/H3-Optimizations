@@ -175,14 +175,18 @@ class SparseTileRouter:
 
     @staticmethod
     def _retained(video_budget, geometry):
+        video_budget = float(video_budget)
+        if video_budget <= 0.0:
+            return 1
+        if video_budget >= 1.0:
+            return geometry.pure_video_kv_tiles
         return min(
             geometry.pure_video_kv_tiles,
             max(
                 1,
                 int(
                     math.ceil(
-                        float(video_budget)
-                        * geometry.pure_video_kv_tiles
+                        video_budget * geometry.pure_video_kv_tiles
                     )
                 ),
             ),
@@ -242,8 +246,8 @@ class SparseTileRouter:
                 'tile router requires equal Q/K shapes; got %s %s'
                 % (tuple(q.shape), tuple(k.shape))
             )
-        if not 0.01 <= float(video_budget) <= 1.0:
-            raise SparseRouterError('video_budget must be in [0.01, 1]')
+        if not math.isfinite(float(video_budget)):
+            raise SparseRouterError('video_budget must be finite')
         geometry = self.geometry(layout)
         if q.shape[-2] != geometry.sequence:
             raise SparseRouterError(
@@ -280,8 +284,8 @@ class SparseTileRouter:
             raise SparseRouterError('Q/K router summary dimensions differ')
         if q_summary.device != k_summary.device:
             raise SparseRouterError('Q/K router summary devices differ')
-        if not 0.01 <= float(video_budget) <= 1.0:
-            raise SparseRouterError('video_budget must be in [0.01, 1]')
+        if not math.isfinite(float(video_budget)):
+            raise SparseRouterError('video_budget must be finite')
         geometry = self.geometry(layout)
         expected_q = (geometry.q_tiles, q_summary.shape[-1])
         expected_k = (geometry.kv_tiles, k_summary.shape[-1])

@@ -487,8 +487,8 @@ def _prepare_streamed_route_plan(
     """Prepare K-owned routing state without projecting Q ahead of execution."""
     if k_summary.ndim != 4:
         raise SparseRouterError("K router summary must be a rank-4 HND tensor")
-    if not 0.01 <= float(video_budget) <= 1.0:
-        raise SparseRouterError("video_budget must be in [0.01, 1]")
+    if not math.isfinite(float(video_budget)):
+        raise SparseRouterError("video_budget must be finite")
 
     geometry = router.geometry(layout)
     if tuple(k_summary.shape[-2:]) != (

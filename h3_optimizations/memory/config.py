@@ -16,8 +16,6 @@ IMPLEMENTED_MODES = (
 )
 DEFAULT_MODE = MODE_NATIVE
 
-MIN_CHUNK_ROWS = 256
-MAX_CHUNK_ROWS = 65_536
 DEFAULT_CHUNK_ROWS = 4_096
 DEFAULT_ALIGNMENT = 256
 
@@ -36,20 +34,15 @@ class ActivationMemoryConfig:
                 'MLP memory mode %r is unavailable; implemented modes: %s'
                 % (self.mode, ', '.join(IMPLEMENTED_MODES))
             )
-        if not MIN_CHUNK_ROWS <= int(self.chunk_rows) <= MAX_CHUNK_ROWS:
-            raise ValueError(
-                'chunk_rows must be between %d and %d, got %r'
-                % (MIN_CHUNK_ROWS, MAX_CHUNK_ROWS, self.chunk_rows)
-            )
+        chunk_rows = int(self.chunk_rows)
+        if (
+            isinstance(self.chunk_rows, bool)
+            or chunk_rows != self.chunk_rows
+            or chunk_rows <= 0
+        ):
+            raise ValueError('chunk_rows must be a positive integer')
         if int(self.alignment) <= 0:
             raise ValueError('alignment must be positive')
-        if int(self.chunk_rows) < int(self.alignment):
-            raise ValueError('chunk_rows must be at least alignment')
-        if int(self.chunk_rows) % int(self.alignment):
-            raise ValueError(
-                'chunk_rows (%d) must be a multiple of alignment (%d)'
-                % (self.chunk_rows, self.alignment)
-            )
 
     @property
     def native_swiglu(self):

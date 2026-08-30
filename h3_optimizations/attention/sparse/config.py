@@ -22,8 +22,8 @@ def _validate_budget(name, value):
     if value is None:
         return
     budget = float(value)
-    if not math.isfinite(budget) or not 0.01 <= budget <= 1.0:
-        raise ValueError('%s must be finite and in [0.01, 1]' % name)
+    if not math.isfinite(budget):
+        raise ValueError('%s must be finite' % name)
 
 
 @dataclass(frozen=True)
@@ -116,9 +116,11 @@ def resolve_video_budget(config, step_index, total_steps, layer_index=None):
         in_late = step_index >= total_steps - int(config.late_steps)
         early_budget = float(config.early_kv)
         if in_early and config.early_schedule == EARLY_SCHEDULE_RAMP:
-            early_budget += (
-                budget - early_budget
-            ) * step_index / int(config.early_steps)
+            fraction = step_index / int(config.early_steps)
+            early_budget = math.fsum((
+                early_budget * (1.0 - fraction),
+                budget * fraction,
+            ))
         if in_early and in_late:
             return max(early_budget, float(config.late_kv))
         if in_early:

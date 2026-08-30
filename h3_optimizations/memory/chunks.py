@@ -108,8 +108,7 @@ def iter_mod_chunks(segments, seq_len, max_rows, alignment=1, mod_rows=None):
         raise ValueError("max_rows must be positive")
     if alignment <= 0:
         raise ValueError("alignment must be positive")
-    if max_rows < alignment:
-        raise ValueError("max_rows must be at least alignment")
+    alignment = min(alignment, max_rows)
 
     normalized = validate_mod_segments(segments, seq_len, mod_rows=mod_rows)
     for segment_start, segment_stop, selector in normalized:

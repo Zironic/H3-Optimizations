@@ -224,6 +224,23 @@ class PublicNodeTests(unittest.TestCase):
         self.assertTrue(H3MemoryOptimization.validate_inputs(PRECISION_MODE_PRESERVE))
         self.assertTrue(H3MemoryOptimization.validate_inputs(PRECISION_MODE_ALLOW_FP8))
 
+    def test_memory_node_accepts_any_positive_chunk_size(self):
+        for chunk_rows in (1, 257, 65_537):
+            self.assertTrue(
+                H3MemoryOptimization.validate_inputs(
+                    PRECISION_MODE_AUTO,
+                    chunk_rows,
+                )
+            )
+        for chunk_rows in (0, -1):
+            self.assertIsInstance(
+                H3MemoryOptimization.validate_inputs(
+                    PRECISION_MODE_AUTO,
+                    chunk_rows,
+                ),
+                str,
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

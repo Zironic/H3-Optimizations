@@ -61,6 +61,13 @@ class MemoryTests(unittest.TestCase):
         )
         self.assertTrue(compatibility.bf16_swiglu)
         self.assertFalse(compatibility.prefer_held_weights)
+        for chunk_rows in (1, 257, 65_537):
+            self.assertEqual(
+                ActivationMemoryConfig(chunk_rows=chunk_rows).chunk_rows,
+                chunk_rows,
+            )
+        with self.assertRaisesRegex(ValueError, 'positive integer'):
+            ActivationMemoryConfig(chunk_rows=0)
 
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(
@@ -121,6 +128,20 @@ class MemoryTests(unittest.TestCase):
                 [(0, 4, torch.zeros(4, dtype=torch.float32))],
                 4,
             )
+
+    def test_chunk_planner_adapts_alignment_to_small_positive_limits(self):
+        result = list(
+            chunks.iter_mod_chunks(
+                [(0, 5, 0)],
+                5,
+                max_rows=3,
+                alignment=256,
+            )
+        )
+        self.assertEqual(
+            [(chunk.start, chunk.stop) for chunk in result],
+            [(0, 3), (3, 5)],
+        )
 
     def test_acquired_weight_release_is_exactly_once(self):
         acquired = linear_module.AcquiredLinear(
@@ -304,8 +325,8 @@ class MemoryTests(unittest.TestCase):
             0,
             ActivationMemoryConfig(
                 mode=MODE_NATIVE,
-                chunk_rows=256,
-                alignment=256,
+                chunk_rows=8,
+                alignment=4,
             ),
         )(
             x.clone(),
@@ -318,6 +339,49 @@ class MemoryTests(unittest.TestCase):
             torch.allclose(actual, expected, rtol=1e-5, atol=2e-6)
         )
         self.assertTrue(torch.isfinite(actual).all())
+
+    def test_oversized_chunk_uses_one_upstream_mlp_call_without_held_path(self):
+        torch.manual_seed(36)
+        block = self._make_block()
+        x = torch.randn(19, 32) * 0.1
+        t_emb = torch.randn(1, 24) * 0.1
+        segments = [(0, 5, 0), (5, 13, 1), (13, 19, 2)]
+        expected = block.forward(
+            x.clone(),
+            t_emb,
+            segments,
+            rope_freqs=None,
+            transformer_options={},
+        )
+
+        with patch(
+            'h3_optimizations.memory.forward.bind_convrot_mlp',
+        ), patch(
+            'h3_optimizations.memory.forward._open_mlp',
+            side_effect=AssertionError('held or sliced MLP path must stay disabled'),
+        ), patch.object(
+            block.mlp,
+            'forward',
+            wraps=block.mlp.forward,
+        ) as upstream_mlp:
+            actual = make_forward(
+                block,
+                0,
+                ActivationMemoryConfig(
+                    mode=MODE_CONVROT_2SLICE,
+                    chunk_rows=x.shape[0],
+                ),
+            )(
+                x.clone(),
+                t_emb,
+                segments,
+                rope_freqs=None,
+                transformer_options={},
+            )
+
+        upstream_mlp.assert_called_once()
+        self.assertEqual(upstream_mlp.call_args.args[0].shape[0], x.shape[0])
+        self.assertTrue(torch.allclose(actual, expected, rtol=1e-5, atol=2e-6))
 
     def test_masked_per_token_forward_matches_core_across_chunks(self):
         torch.manual_seed(31)

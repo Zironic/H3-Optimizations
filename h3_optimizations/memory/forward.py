@@ -243,15 +243,6 @@ def make_forward(block, layer_index, config, original_forward=None):
             x.shape[0],
             mod_rows=shift_msa.shape[0],
         )
-        chunks = tuple(
-            iter_mod_chunks(
-                segments,
-                x.shape[0],
-                config.chunk_rows,
-                alignment=config.alignment,
-                mod_rows=shift_mlp.shape[0],
-            )
-        )
 
         # Keep lazy Norm1 below the attention abstraction boundary. The block
         # always calls attention with a real Tensor; only a package-owned
@@ -291,6 +282,36 @@ def make_forward(block, layer_index, config, original_forward=None):
                 selector,
             )
         del h, attn_out
+
+        if int(config.chunk_rows) >= int(x.shape[0]):
+            h = block.norm2(x)
+            for start, stop, selector in segments:
+                _scale_shift(
+                    h[start:stop],
+                    shift_mlp,
+                    scale_mlp,
+                    selector,
+                )
+            out = block.mlp(h)
+            for start, stop, selector in segments:
+                _gate_add(
+                    x[start:stop],
+                    out[start:stop],
+                    gate_mlp,
+                    selector,
+                )
+            del h, out
+            return x
+
+        chunks = tuple(
+            iter_mod_chunks(
+                segments,
+                x.shape[0],
+                config.chunk_rows,
+                alignment=config.alignment,
+                mod_rows=shift_mlp.shape[0],
+            )
+        )
 
         held, mlp_path, held_error = _open_mlp(block, x[:1], config)
         if held_error is not None:

@@ -1,5 +1,7 @@
 '''Composable production nodes for MiniMax H3 optimization.'''
 
+import math
+
 from comfy_api.latest import io, ui
 
 from .apply import apply_plan
@@ -37,9 +39,23 @@ def _video_budget_input():
             'change the result. There is no universally safe value: some prompts '
             'tolerate very low budgets while others require substantially more. '
             'The request rounds up to whole KV tiles; non-video context and mixed '
-            'boundary tiles stay dense. 1.0 retains the full video route.'
+            'boundary tiles stay dense. 1.0 retains the full video route. The '
+            'displayed range is the recommended editing range; finite workflow '
+            'values outside it saturate to at least one or at most all video tiles.'
         ),
     )
+
+
+def _validate_budget(name, value):
+    if not math.isfinite(float(value)):
+        return '%s must be finite' % name
+    return None
+
+
+def _validate_steps(name, value):
+    if isinstance(value, bool) or int(value) != value or int(value) < 0:
+        return '%s must be a non-negative integer' % name
+    return None
 
 
 class H3SparseAttention(io.ComfyNode):
@@ -106,6 +122,10 @@ class H3SparseAttention(io.ComfyNode):
             ui=ui.PreviewText(format_sparse_status(patched)),
         )
 
+    @classmethod
+    def validate_inputs(cls, video_budget=DEFAULT_VIDEO_BUDGET):
+        return _validate_budget('video_budget', video_budget) or True
+
 
 class H3SparseAttentionAdvanced(io.ComfyNode):
     '''Sparse attention with explicit backend and sampling-step schedules.'''
@@ -147,7 +167,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     tooltip=(
                         'Hold uses Early KV for this many opening steps. Ramp '
                         'moves from Early KV toward Video attention budget over '
-                        'this many steps. Set 0 to disable the early schedule.'
+                        'this many steps. Set 0 to disable the early schedule. '
+                        'Values above the displayed editing range remain valid.'
                     ),
                 ),
                 io.Float.Input(
@@ -173,7 +194,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     tooltip=(
                         'Number of final sampling steps that use Late KV. The default '
                         'is 0 because denser late steps have not shown enough benefit '
-                        'to justify their compute cost.'
+                        'to justify their compute cost. Values above the displayed '
+                        'editing range remain valid.'
                     ),
                 ),
                 io.Float.Input(
@@ -252,9 +274,33 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, backend, early_schedule=EARLY_SCHEDULE_HOLD):
+    def validate_inputs(
+        cls,
+        backend,
+        early_schedule=EARLY_SCHEDULE_HOLD,
+        video_budget=DEFAULT_VIDEO_BUDGET,
+        early_steps=DEFAULT_EDGE_STEPS,
+        early_kv=DEFAULT_EDGE_KV,
+        late_steps=DEFAULT_LATE_STEPS,
+        late_kv=DEFAULT_EDGE_KV,
+    ):
         if backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
         if early_schedule not in EARLY_SCHEDULE_OPTIONS:
             return 'unknown early schedule %r' % early_schedule
+        for name, value in (
+            ('video_budget', video_budget),
+            ('early_kv', early_kv),
+            ('late_kv', late_kv),
+        ):
+            error = _validate_budget(name, value)
+            if error is not None:
+                return error
+        for name, value in (
+            ('early_steps', early_steps),
+            ('late_steps', late_steps),
+        ):
+            error = _validate_steps(name, value)
+            if error is not None:
+                return error
         return True

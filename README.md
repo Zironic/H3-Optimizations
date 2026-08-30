@@ -82,7 +82,10 @@ video attention connections for speed.
 - **Attention memory mode: Standard** — prioritizes speed. `Lower VRAM (slower)`
   is available when you need to squeeze peak memory further.
 - **Activation chunk rows** is an advanced control. Larger chunks can be faster
-  but use more temporary memory.
+  but use more temporary memory. The UI range and 256-row step are editing
+  recommendations; saved workflows may use any positive integer. A value at or
+  above the current packed input length uses the ordinary unsliced MLP for that
+  invocation instead of entering an effectively unchunked two-slice mode.
 
 The advanced precision and streaming controls are mainly useful for debugging,
 benchmarking, or deliberately forcing a particular execution policy.
@@ -135,6 +138,10 @@ The default video attention budget is **15%**.
 without this node.” The Sparse Attention node can still resolve through its own
 backend path. Bypass the node when you want the ordinary dense baseline.
 
+The displayed `0.01` to `1.0` budget range is the recommended editing range,
+not a server-side execution limit. Finite values below it retain at least one
+whole video KV tile, while values above it saturate at the full video route.
+
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
 
@@ -167,6 +174,8 @@ selector.
   Video attention budget over those steps. Set Early steps to `0` to disable it.
 - **Early steps / Early KV** control the duration and held or starting budget.
 - **Late steps / Late KV** do the same for the final steps.
+- Step counts above the displayed `1000` editing limit remain valid; only
+  negative step counts are rejected.
 - If the early and late windows overlap, the denser requested budget wins.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.

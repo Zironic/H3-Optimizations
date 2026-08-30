@@ -154,12 +154,20 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different H3 Sparse'):
             plan.with_sparse(SparseRequest(video_budget=0.4))
     def test_validation_boundaries(self):
-        MemoryRequest(chunk_rows=256)
-        MemoryRequest(chunk_rows=65_536)
-        for chunk_rows in (255, 257, 65_792):
+        for chunk_rows in (1, 255, 257, 65_536, 65_792):
+            self.assertEqual(
+                MemoryRequest(chunk_rows=chunk_rows).chunk_rows,
+                chunk_rows,
+            )
+        for chunk_rows in (0, -1, 1.5, True):
             with self.assertRaises(ValueError):
                 MemoryRequest(chunk_rows=chunk_rows)
-        for budget in (0.0, 1.01, math.inf, math.nan):
+        for budget in (-1.0, 0.0, 1.01, 2.0):
+            self.assertEqual(
+                SparseRequest(video_budget=budget).video_budget,
+                budget,
+            )
+        for budget in (math.inf, -math.inf, math.nan):
             with self.assertRaises(ValueError):
                 SparseRequest(video_budget=budget)
         with self.assertRaisesRegex(ValueError, 'unknown sparse backend'):
@@ -168,9 +176,9 @@ class PlanTests(unittest.TestCase):
             SparseRequest(early_schedule='Curve')
         SparseRequest(
             early_steps=0,
-            early_kv=0.01,
-            late_steps=1000,
-            late_kv=1.0,
+            early_kv=0.0,
+            late_steps=1001,
+            late_kv=1.01,
         )
         with self.assertRaises(ValueError):
             SparseRequest(early_steps=2)
@@ -181,13 +189,12 @@ class PlanTests(unittest.TestCase):
                 late_steps=2,
                 late_kv=0.5,
             )
-        with self.assertRaises(ValueError):
-            SparseRequest(
-                early_steps=2,
-                early_kv=0.0,
-                late_steps=2,
-                late_kv=0.5,
-            )
+        SparseRequest(
+            early_steps=2,
+            early_kv=-0.5,
+            late_steps=2000,
+            late_kv=1.5,
+        )
         with self.assertRaises(ValueError):
             SparseRequest(
                 denser_early_late_steps=True,

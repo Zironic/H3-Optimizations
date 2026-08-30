@@ -116,8 +116,11 @@ def _available_sparse_alternatives(selected, environment):
 
 def _explicit_backend_error(backend, error, environment):
     alternatives = _available_sparse_alternatives(backend, environment)
-    message = '%s is unavailable: %s.' % (
+    architecture = getattr(environment, 'architecture', None)
+    system = architecture or getattr(environment, 'backend', None) or 'this system'
+    message = '%s is unavailable on %s: %s.' % (
         _BACKEND_LABELS.get(backend, str(backend)),
+        system,
         error,
     )
     if alternatives:
@@ -125,10 +128,10 @@ def _explicit_backend_error(backend, error, environment):
             ', '.join(alternatives)
         )
     else:
-        message += ' No alternative sparse backend passed its availability preflight.'
+        message += ' No compatible alternative sparse backend was detected.'
     message += (
-        ' Use the normal H3 Sparse Attention node instead of the Advanced node '
-        'for automatic backend selection and fallback.'
+        ' Use H3 Sparse Attention instead of H3 Sparse Attention (Advanced) '
+        'to select a compatible backend automatically or fall back to dense attention.'
     )
     return message
 

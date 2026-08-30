@@ -82,7 +82,7 @@ class SparseBackendGuidanceTests(unittest.TestCase):
                 )
 
         text = str(raised.exception)
-        self.assertIn('Sparse Sage is unavailable', text)
+        self.assertIn('Sparse Sage is unavailable on sm75', text)
         self.assertIn('device capability 7.5', text)
         self.assertIn(
             'Available sparse backends detected on this system: Kitchen INT8',
@@ -90,7 +90,8 @@ class SparseBackendGuidanceTests(unittest.TestCase):
         )
         self.assertNotIn('BF16 Triton,', text)
         self.assertIn('H3 Sparse Attention', text)
-        self.assertIn('automatic backend selection and fallback', text)
+        self.assertIn('select a compatible backend automatically', text)
+        self.assertIn('fall back to dense attention', text)
 
     def test_rocm_sparse_sage_failure_recommends_detected_triton_and_flex(self):
         environment = SimpleNamespace(
@@ -134,13 +135,14 @@ class SparseBackendGuidanceTests(unittest.TestCase):
                 )
 
         text = str(raised.exception)
+        self.assertIn('Sparse Sage is unavailable on rocm', text)
         self.assertIn('Hybrid Sparse Attention requires CUDA', text)
         self.assertIn(
             'Available sparse backends detected on this system: '
             'BF16 Triton, FP8 FlexAttention',
             text,
         )
-        self.assertIn('automatic backend selection and fallback', text)
+        self.assertIn('select a compatible backend automatically', text)
 
     def test_no_alternative_keeps_original_reason_and_suggests_auto(self):
         environment = SimpleNamespace(
@@ -172,10 +174,56 @@ class SparseBackendGuidanceTests(unittest.TestCase):
         text = str(raised.exception)
         self.assertIn('requires a GPU', text)
         self.assertIn(
-            'No alternative sparse backend passed its availability preflight',
+            'No compatible alternative sparse backend was detected',
             text,
         )
         self.assertIn('H3 Sparse Attention', text)
+
+    def test_architecture_errors_name_the_backend_system_and_recovery(self):
+        environment = SimpleNamespace(
+            backend='nvidia_cuda',
+            architecture='sm75',
+        )
+        cases = (
+            (
+                policy.SPARSE_BACKEND_FROST,
+                policy.FrostBF16Error(
+                    'FROST BF16 is compiled for SM89; found SM75'
+                ),
+                'FROST BF16 (SM89) is unavailable on sm75',
+            ),
+            (
+                policy.SPARSE_BACKEND_TRITON,
+                policy._base.TritonSparseError(
+                    'BF16 Triton requires NVIDIA compute capability 8.0 or newer'
+                ),
+                'BF16 Triton is unavailable on sm75',
+            ),
+            (
+                policy.SPARSE_BACKEND_FLEX,
+                policy._base.FP8FlexError(
+                    'FP8 compute is unsupported on device capability 7.5'
+                ),
+                'FP8 FlexAttention is unavailable on sm75',
+            ),
+        )
+        with mock.patch.object(
+            policy,
+            '_available_sparse_alternatives',
+            return_value=['Kitchen INT8'],
+        ):
+            for backend, error, heading in cases:
+                with self.subTest(backend=backend):
+                    text = policy._explicit_backend_error(
+                        backend,
+                        error,
+                        environment,
+                    )
+                    self.assertIn(heading, text)
+                    self.assertIn(str(error), text)
+                    self.assertIn('Kitchen INT8', text)
+                    self.assertIn('H3 Sparse Attention (Advanced)', text)
+                    self.assertIn('fall back to dense attention', text)
 
     def test_auto_errors_are_not_rewritten_or_probed(self):
         environment = SimpleNamespace()

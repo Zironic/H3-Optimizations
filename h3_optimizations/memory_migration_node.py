@@ -243,7 +243,10 @@ class H3MemoryOptimization(io.ComfyNode):
                     tooltip=(
                         'Maximum token rows processed by one MLP or FinalLayer '
                         'chunk. Larger chunks may be faster but use more activation '
-                        'memory.'
+                        'memory. The displayed range and step are recommendations; '
+                        'any positive workflow value is accepted. At or above the '
+                        'current input length, the ordinary unsliced MLP runs for '
+                        'that invocation.'
                     ),
                 ),
                 # Original preserve_precision slot. Keep serialized and hidden.
@@ -357,9 +360,15 @@ class H3MemoryOptimization(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, precision_mode):
+    def validate_inputs(cls, precision_mode, chunk_rows=DEFAULT_CHUNK_ROWS):
         try:
             _normalize_precision_mode(precision_mode)
         except ValueError as exc:
             return str(exc)
+        if (
+            isinstance(chunk_rows, bool)
+            or int(chunk_rows) != chunk_rows
+            or int(chunk_rows) <= 0
+        ):
+            return 'chunk_rows must be a positive integer'
         return True

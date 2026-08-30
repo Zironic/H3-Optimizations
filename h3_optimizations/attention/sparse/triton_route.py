@@ -1,6 +1,7 @@
 '''Compact fixed-density routes for the BF16 Triton sparse backend.'''
 
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -33,8 +34,8 @@ def _validate_summaries(router, q_summary, k_summary, layout, video_budget):
         raise TritonRouteError('Triton route Q/K summary dimensions differ')
     if q_summary.device != k_summary.device:
         raise TritonRouteError('Triton route Q/K summary devices differ')
-    if not 0.01 <= float(video_budget) <= 1.0:
-        raise TritonRouteError('video_budget must be in [0.01, 1]')
+    if not math.isfinite(float(video_budget)):
+        raise TritonRouteError('video_budget must be finite')
     try:
         geometry = router.geometry(layout)
     except SparseRouterError as exc:
@@ -116,8 +117,8 @@ def prepare_compact_absolute_route_chunks(
 ):
     if k_summary.ndim != 4:
         raise TritonRouteError('Triton K route summary must be rank-4 HND')
-    if not 0.01 <= float(video_budget) <= 1.0:
-        raise TritonRouteError('video_budget must be in [0.01, 1]')
+    if not math.isfinite(float(video_budget)):
+        raise TritonRouteError('video_budget must be finite')
     try:
         geometry = router.geometry(layout)
     except SparseRouterError as exc:

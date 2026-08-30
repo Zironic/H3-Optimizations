@@ -107,6 +107,17 @@ def apply_in_order(base, first_request, second_request):
     return apply_module.apply_plan(first, plan)
 
 
+def run_prepare_wrappers(model):
+    wrapper_type = comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING
+    wrappers = model.wrappers[wrapper_type][
+        apply_module.PREPARE_WRAPPER_KEY
+    ]
+    return comfy.patcher_extension.WrapperExecutor.new_executor(
+        lambda patcher, *_args, **_kwargs: patcher,
+        wrappers,
+    ).execute(model)
+
+
 class ApplyCompositionTests(unittest.TestCase):
     def test_live_option_sync_is_a_no_op_for_the_patcher_options_object(self):
         wrapper = lambda executor, *args, **kwargs: executor(*args, **kwargs)
@@ -400,14 +411,39 @@ class ApplyCompositionTests(unittest.TestCase):
             apply_module,
             '_ensure_sparse_runtime',
             return_value=(object(), True),
-        ), self.assertLogs(level='INFO') as logs:
-            left = apply_in_order(FakeModel(), memory, sparse)
-            right = apply_in_order(FakeModel(), sparse, memory)
+        ):
+            with self.assertNoLogs(level='INFO'):
+                memory_only = apply_module.apply_plan(
+                    FakeModel(),
+                    H3OptimizationPlan(memory=memory),
+                )
+                sparse_only = apply_module.apply_plan(
+                    FakeModel(),
+                    H3OptimizationPlan(sparse=sparse),
+                )
+                left = apply_in_order(FakeModel(), memory, sparse)
+                right = apply_in_order(FakeModel(), sparse, memory)
+
+            with self.assertLogs(level='INFO') as logs:
+                run_prepare_wrappers(memory_only)
+                run_prepare_wrappers(sparse_only)
+                run_prepare_wrappers(left)
+                run_prepare_wrappers(right)
 
         applied_logs = [
             line for line in logs.output if ' applied plan: ' in line
         ]
-        self.assertTrue(applied_logs)
+        self.assertEqual(len(applied_logs), 4)
+        self.assertTrue(all('phase=prepare' in line for line in applied_logs))
+        self.assertEqual(sum(
+            'features=memory ' in line for line in applied_logs
+        ), 1)
+        self.assertEqual(sum(
+            'features=sparse ' in line for line in applied_logs
+        ), 1)
+        self.assertEqual(sum(
+            'features=memory+sparse ' in line for line in applied_logs
+        ), 2)
         self.assertTrue(all(
             'qkv_weights=TensorWiseINT8Layout+convrot256 qkv_layers=50' in line
             for line in applied_logs
@@ -416,9 +452,8 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertTrue(any(
             'features=memory+sparse' in line for line in applied_logs
         ))
-        self.assertTrue(any(
-            'replaces_attention=comfy_kitchen_int8' in line
-            for line in applied_logs
+        self.assertFalse(any(
+            'replaces_attention=' in line for line in applied_logs
         ))
         self.assertFalse(any(' armed: ' in line for line in logs.output))
         self.assertEqual(

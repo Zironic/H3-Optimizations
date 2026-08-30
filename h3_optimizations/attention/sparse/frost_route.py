@@ -1,6 +1,7 @@
 '''Direct full-width absolute routes for the BF16 FROST backend.'''
 
 from dataclasses import dataclass
+import math
 
 import torch
 
@@ -91,8 +92,8 @@ def prepare_full_absolute_route_chunks(
 ):
     if k_summary.ndim != 4:
         raise TritonRouteError('FROST K route summary must be rank-4 HND')
-    if not 0.01 <= float(video_budget) <= 1.0:
-        raise TritonRouteError('video_budget must be in [0.01, 1]')
+    if not math.isfinite(float(video_budget)):
+        raise TritonRouteError('video_budget must be finite')
     try:
         geometry = router.geometry(layout)
     except SparseRouterError as error:

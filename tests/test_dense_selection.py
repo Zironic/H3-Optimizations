@@ -60,6 +60,13 @@ class FakePatcher:
         ModelPatcher.set_model_optimized_attention(self, attention)
 
 
+class ChunkRowsTests(unittest.TestCase):
+    def test_qkv_chunk_rows_preserve_kernel_alignment(self):
+        self.assertEqual(apply_module._effective_qkv_chunk_rows(1), 256)
+        self.assertEqual(apply_module._effective_qkv_chunk_rows(257), 256)
+        self.assertEqual(apply_module._effective_qkv_chunk_rows(65_537), 65_536)
+
+
 def kitchen_attention(*_args, **_kwargs):
     return None
 

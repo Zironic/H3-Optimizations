@@ -67,6 +67,7 @@ from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
 from .plan import (
     ATTENTION_EXISTING,
+    CHUNK_ALIGNMENT,
     DENSITY_FIXED,
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
@@ -158,6 +159,14 @@ _BOUNDED_QKV_PROVIDERS = (
 def _reconciliation_log_level(phase):
     '''Only the final prepare-time reconciliation is user-facing at INFO.'''
     return logging.INFO if phase == 'prepare' else logging.DEBUG
+
+
+def _effective_qkv_chunk_rows(chunk_rows):
+    chunk_rows = int(chunk_rows)
+    return max(
+        CHUNK_ALIGNMENT,
+        chunk_rows - chunk_rows % CHUNK_ALIGNMENT,
+    )
 
 
 def _bounded_qkv_projector(qkv, chunk_rows=4096):
@@ -340,6 +349,11 @@ def describe_memory_options(attention):
 
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
+    qkv_chunk_rows = (
+        None
+        if memory is None
+        else _effective_qkv_chunk_rows(memory.chunk_rows)
+    )
     options = getattr(model, 'model_options', {}).get(
         'transformer_options',
         {},
@@ -416,7 +430,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
         backend = StreamedDenseSageBackend(dense.backend)
         projector = StreamedDenseSageQKVProjector(
             dense.backend,
-            chunk_rows=memory.chunk_rows,
+            chunk_rows=qkv_chunk_rows,
             projection_mode=_streamed_projection_mode(qkv, inventory),
             v_mode=memory.attention_v_memory,
         )
@@ -427,13 +441,13 @@ def _resolve_dense(plan, model, inventory, environment=None):
             and dense.backend_kind != 'sage'
         ) or memory.qkv_streaming == QKV_STREAMING_FORCED:
             projector = StreamedDenseBF16QKVProjector(
-                chunk_rows=memory.chunk_rows,
+                chunk_rows=qkv_chunk_rows,
                 projection_mode=_streamed_projection_mode(qkv, inventory),
             )
         else:
             projector = _bounded_qkv_projector(
                 qkv,
-                chunk_rows=memory.chunk_rows,
+                chunk_rows=qkv_chunk_rows,
             )
     elif qkv.provider_id in (
         QKV_DENSE_KITCHEN_CHUNKED,
@@ -443,12 +457,12 @@ def _resolve_dense(plan, model, inventory, environment=None):
     ):
         backend = ChunkedKitchenAttentionBackend(
             stream_output=True,
-            query_chunk_rows=memory.chunk_rows,
+            query_chunk_rows=qkv_chunk_rows,
         )
         # The chunk quantizer is handed the same strided Q/K views here as on
         # the sparse path, and takes them through the same guarded predicate.
         projector = ChunkedKitchenQKVProjector(
-            chunk_rows=memory.chunk_rows,
+            chunk_rows=qkv_chunk_rows,
             force_weights_bf16=(
                 qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
             ),
