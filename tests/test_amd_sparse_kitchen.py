@@ -1,5 +1,6 @@
 """CPU/static contracts for the experimental gfx12 Sparse Kitchen branch."""
 
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -164,6 +165,32 @@ class ExperimentalAMDSparseKitchenTests(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertNotIn('#error', header)
         self.assertIn('#if defined(__gfx1200__) || defined(__gfx1201__)', header)
+
+    def test_prebuilt_libraries_match_manifests_and_target_both_gfx12_arches(self):
+        binary_root = PACK / 'native' / 'hip' / 'bin'
+        linux_binary = binary_root / 'libh3_hip_sparse_kitchen.so'
+        windows_binary = binary_root / 'h3_hip_sparse_kitchen.dll'
+        linux_bytes = linux_binary.read_bytes()
+        windows_bytes = windows_binary.read_bytes()
+
+        self.assertEqual(linux_bytes[:4], b'\x7fELF')
+        self.assertEqual(windows_bytes[:2], b'MZ')
+        for contents in (linux_bytes, windows_bytes):
+            self.assertIn(b'gfx1200', contents)
+            self.assertIn(b'gfx1201', contents)
+
+        linux_info = (binary_root / 'BUILD_INFO-linux.txt').read_text().splitlines()
+        windows_info = (binary_root / 'BUILD_INFO-windows.txt').read_text().splitlines()
+        linux_values = dict(line.split('=', 1) for line in linux_info[:4])
+        windows_values = dict(line.split('=', 1) for line in windows_info)
+        self.assertRegex(linux_values['source_sha'], r'^[0-9a-f]{40}$')
+        self.assertEqual(linux_values['source_sha'], windows_values['source_sha'])
+        self.assertEqual(linux_values['rocm_version'], '7.2.1')
+        self.assertEqual(windows_values['rocm_version'], '7.2.1')
+        self.assertEqual(linux_values['architectures'], 'gfx1200;gfx1201')
+        self.assertEqual(windows_values['architectures'], 'gfx1200;gfx1201')
+        self.assertEqual(hashlib.sha256(linux_bytes).hexdigest(), linux_info[4].split()[0])
+        self.assertEqual(hashlib.sha256(windows_bytes).hexdigest(), windows_values['sha256'])
 
     def test_vendored_kernel_is_bm64_with_indexed_kv_traversal(self):
         source = (

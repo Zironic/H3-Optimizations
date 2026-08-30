@@ -1,0 +1,5 @@
+source_sha=9f337dc7bc590768a5943211f1e68228d318cf22
+rocm_version=7.2.1
+platform=windows-x64
+architectures=gfx1200;gfx1201
+sha256=333b17f664d88d1eb0d2d82af79fac7194209d1a06b0470c08c9b9f16b7f8dc5

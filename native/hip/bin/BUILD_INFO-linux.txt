@@ -1,0 +1,5 @@
+source_sha=9f337dc7bc590768a5943211f1e68228d318cf22
+rocm_version=7.2.1
+platform=linux-x86_64
+architectures=gfx1200;gfx1201
+23345a51ff8f164ef6a8f6b277a924e82d213b43f22d74fee70259552c3d3ae1  native/hip/bin/libh3_hip_sparse_kitchen.so

@@ -4,10 +4,10 @@ This backend adapts Comfy Kitchen's gfx12 INT8 attention for H3's 64Q x 64KV
 sparse route. It targets only `gfx1200` and `gfx1201` and has not yet been run
 on AMD hardware.
 
-Prebuilt Linux x86-64 and Windows x64 libraries are produced by the
-`Build experimental AMD Sparse Kitchen` workflow. Put the artifact for the
-tester's platform in `native/hip/bin`; no compiler is needed on the test
-machine. The matching ROCm runtime and a supported AMD GPU are still required.
+Prebuilt Linux x86-64 and Windows x64 libraries are shipped in `native/hip/bin`
+and rebuilt by the `Build experimental AMD Sparse Kitchen` workflow. No
+compiler is needed on the test machine. The matching ROCm runtime and a
+supported AMD GPU are still required.
 
 Build on a ROCm development host:
 
