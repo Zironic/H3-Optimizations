@@ -155,6 +155,11 @@ _BOUNDED_QKV_PROVIDERS = (
 )
 
 
+def _reconciliation_log_level(phase):
+    '''Only the final prepare-time reconciliation is user-facing at INFO.'''
+    return logging.INFO if phase == 'prepare' else logging.DEBUG
+
+
 def _bounded_qkv_projector(qkv, chunk_rows=4096):
     return ChunkedBF16QKVProjector(
         chunk_rows=chunk_rows,
@@ -1163,7 +1168,7 @@ def _sync_h3_live_options(model_patcher, live_model_options):
         return
     for key in tuple(target):
         if key.startswith('h3_optimizations_') and key not in source:
-            target.pop(key)
+            target.pop(key, None)
     for key, value in source.items():
         if key.startswith('h3_optimizations_'):
             target[key] = value
@@ -1417,8 +1422,8 @@ def _reconcile_plan(
         and previous_attention != attention_name
         else ''
     )
-    log = logging.debug if phase == 'prepare' else logging.info
-    log(
+    logging.log(
+        _reconciliation_log_level(phase),
         '%s applied plan: phase=%s features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s embedding=%s memory=%s device=%s',
         LOG_PREFIX,
         phase,
