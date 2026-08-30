@@ -1,5 +1,5 @@
-source_sha=9f337dc7bc590768a5943211f1e68228d318cf22
+source_sha=91e2c749628af516920f524f0b9d366e932d0d85
 rocm_version=7.2.1
 platform=linux-x86_64
-architectures=gfx1200;gfx1201
-23345a51ff8f164ef6a8f6b277a924e82d213b43f22d74fee70259552c3d3ae1  native/hip/bin/libh3_hip_sparse_kitchen.so
+architectures=gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201
+8e44f64eec09a6fb934b7b875be7502066b3572d00fddd7bedac375d0322b848  native/hip/bin/libh3_hip_sparse_kitchen.so
