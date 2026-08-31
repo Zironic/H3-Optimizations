@@ -168,6 +168,22 @@ def _bind(library):
         [p] * 3 + [i] * 7 + [i64] * 3 + [i, sz]
     )
 
+    try:
+        convrot = library.h3_int8_quantize_bf16_rowwise_convrot256
+    except AttributeError:
+        pass
+    else:
+        convrot.restype = i
+        convrot.argtypes = [p] * 3 + [i64] * 2 + [sz]
+
+    try:
+        fused_q = library.h3_int8_fused_q
+    except AttributeError:
+        pass
+    else:
+        fused_q.restype = i
+        fused_q.argtypes = [p] * 9 + [i64] * 3 + [i, f, sz]
+
     library.h3_int8_quantize_v.restype = i
     library.h3_int8_quantize_v.argtypes = [p, p, p] + [i] * 5 + [i64] * 3 + [i, sz]
     return library

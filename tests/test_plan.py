@@ -25,8 +25,11 @@ from h3_optimizations.plan import (  # noqa: E402
     MemoryRequest,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_TRITON,
     SparseRequest,
+    VIDEO_TOKEN_ORDER_1X8X8,
+    VIDEO_TOKEN_ORDER_RASTER,
 )
 
 
@@ -84,11 +87,13 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.video_budget, 0.15)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
         self.assertEqual(request.early_schedule, EARLY_SCHEDULE_HOLD)
+        self.assertEqual(request.video_token_order, VIDEO_TOKEN_ORDER_1X8X8)
         self.assertFalse(request.advanced_schedule)
 
     def test_legacy_sparse_request_positional_shape_is_preserved(self):
         request = SparseRequest(0.3, False, 2, 0.5, 2, 0.5)
         self.assertEqual(request.backend, SPARSE_BACKEND_AUTO)
+        self.assertEqual(request.video_token_order, VIDEO_TOKEN_ORDER_1X8X8)
         self.assertEqual(
             (
                 request.early_steps,
@@ -104,6 +109,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN)
         self.assertIn(SPARSE_BACKEND_KITCHEN, request.signature)
 
+    def test_rectangular_kitchen_geometry_is_an_explicit_request(self):
+        request = SparseRequest(backend=SPARSE_BACKEND_KITCHEN_64X128)
+        self.assertEqual(request.backend, SPARSE_BACKEND_KITCHEN_64X128)
+        self.assertIn(SPARSE_BACKEND_KITCHEN_64X128, request.signature)
+
     def test_explicit_sparse_schedule_is_part_of_request_identity(self):
         request = SparseRequest(
             video_budget=0.3,
@@ -117,7 +127,13 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(request.advanced_schedule)
         self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
         self.assertIn(EARLY_SCHEDULE_RAMP, request.signature)
-        self.assertEqual(request.signature[-5:-1], (2, 0.5, 2, 0.5))
+        self.assertEqual(request.signature[-6:-2], (2, 0.5, 2, 0.5))
+
+    def test_video_token_order_is_validated_and_part_of_identity(self):
+        request = SparseRequest(video_token_order=VIDEO_TOKEN_ORDER_RASTER)
+        self.assertEqual(request.signature[-1], VIDEO_TOKEN_ORDER_RASTER)
+        with self.assertRaisesRegex(ValueError, 'unknown video token order'):
+            SparseRequest(video_token_order='2x4x8')
 
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()

@@ -38,6 +38,7 @@ from h3_optimizations.plan import (  # noqa: E402
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
     SparseRequest,
@@ -107,6 +108,13 @@ class SparseBackendSelectionTests(unittest.TestCase):
         self.inventory = object()
         self.environment = object()
         self.qkv = qkv_resolution()
+        cube_install = mock.patch.object(
+            apply_module,
+            'install_cube_order',
+            return_value=True,
+        )
+        cube_install.start()
+        self.addCleanup(cube_install.stop)
 
     def test_forced_sparse_sage_does_not_fall_through(self):
         plan = H3OptimizationPlan(
@@ -322,6 +330,33 @@ class SparseBackendSelectionTests(unittest.TestCase):
                 preflight.call_args.kwargs['kv_tile'],
             ),
             (64, 64),
+        )
+
+    def test_rectangular_kitchen_request_reaches_64x128_resolver(self):
+        plan = H3OptimizationPlan(
+            sparse=SparseRequest(backend=SPARSE_BACKEND_KITCHEN_64X128)
+        )
+        target = (resolved('sparse_kitchen_int8'), self.qkv)
+        with mock.patch.object(
+            apply_module,
+            '_resolve_kitchen_sparse',
+            return_value=target,
+        ) as kitchen:
+            self.assertIs(
+                apply_module._resolve_attention(
+                    plan,
+                    self.model,
+                    self.inventory,
+                    self.environment,
+                ),
+                target,
+            )
+        kitchen.assert_called_once_with(
+            plan,
+            self.environment,
+            self.inventory,
+            q_tile=64,
+            kv_tile=128,
         )
 
     def test_preserve_precision_defaults_to_streamed_sparse_kitchen(self):

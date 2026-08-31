@@ -1,0 +1,7 @@
+CUTLASS 4.6.0
+Source: https://github.com/NVIDIA/cutlass
+Commit: d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39
+
+Only the C++ header tree under include/ is vendored. The CuTe DSL Python
+package, examples, tools, generated documentation, and NVIDIA EULA-licensed
+content are not included.

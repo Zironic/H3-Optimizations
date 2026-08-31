@@ -5,8 +5,9 @@ tests/
 .agent/
 
 # Native sources/build tooling are kept in GitHub; Registry installs use the
-# shipped binaries in native/bin. Keep native/LICENSE and native/NOTICE.upstream.
+# shipped binaries in native/bin. Keep native licenses, notices, and provenance.
 native/src/
+native/third_party/cutlass/include/
 native/CMakeLists.txt
 native/Dockerfile.linux
 native/build_linux.sh

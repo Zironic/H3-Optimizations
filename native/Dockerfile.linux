@@ -18,6 +18,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY CMakeLists.txt ./
 COPY src ./src
+COPY third_party ./third_party
 
 # Ninja rather than Make: the flags land literally, which matters here because
 # the exception-handling settings are load-bearing (see the extern "C" note in

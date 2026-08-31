@@ -29,6 +29,7 @@ from h3_optimizations.plan import (  # noqa: E402
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_RAMP,
     H3OptimizationPlan,
+    VIDEO_TOKEN_ORDER_REQUESTS,
 )
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
@@ -80,6 +81,7 @@ class NodeTests(unittest.TestCase):
                 'late_kv',
                 'backend',
                 'early_schedule',
+                'video_token_order',
             ],
         )
         self.assertEqual(
@@ -99,6 +101,7 @@ class NodeTests(unittest.TestCase):
             backend.options,
             [
                 'Kitchen INT8',
+                'Kitchen INT8 64x128 (experimental)',
                 'FROST BF16 (SM89)',
                 'Sparse Sage',
                 'BF16 Triton',
@@ -112,12 +115,18 @@ class NodeTests(unittest.TestCase):
             backend.tooltip,
         )
         self.assertIn('FROST BF16 uses 64Q x 64KV', backend.tooltip)
-        self.assertNotIn('experimental', ' '.join(backend.options).lower())
+        self.assertIn('Kitchen INT8 64x128 (experimental)', backend.options)
         early_schedule = input_by_id(advanced, 'early_schedule')
         self.assertEqual(early_schedule.default, EARLY_SCHEDULE_HOLD)
         self.assertEqual(
             early_schedule.options,
             [EARLY_SCHEDULE_HOLD, EARLY_SCHEDULE_RAMP],
+        )
+        video_token_order = input_by_id(advanced, 'video_token_order')
+        self.assertEqual(video_token_order.default, '1x8x8')
+        self.assertEqual(
+            video_token_order.options,
+            list(VIDEO_TOKEN_ORDER_REQUESTS),
         )
         self.assertTrue(H3SparseAttentionAdvanced.validate_inputs('auto'))
         self.assertIsInstance(
@@ -131,6 +140,11 @@ class NodeTests(unittest.TestCase):
                 'Kitchen INT8 (experimental)'
             )
         )
+        self.assertTrue(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8 64x128 (experimental)'
+            )
+        )
         self.assertIsInstance(
             H3SparseAttentionAdvanced.validate_inputs('not a backend'),
             str,
@@ -139,6 +153,13 @@ class NodeTests(unittest.TestCase):
             H3SparseAttentionAdvanced.validate_inputs(
                 'Kitchen INT8',
                 'Curve',
+            ),
+            str,
+        )
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs(
+                'Kitchen INT8',
+                video_token_order='2x4x8',
             ),
             str,
         )

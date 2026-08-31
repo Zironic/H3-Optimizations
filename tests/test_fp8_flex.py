@@ -114,6 +114,15 @@ class FakeRouter:
 
 
 class FP8FlexTests(unittest.TestCase):
+    def setUp(self):
+        cube_install = mock.patch.object(
+            apply_module,
+            'install_cube_order',
+            return_value=True,
+        )
+        cube_install.start()
+        self.addCleanup(cube_install.stop)
+
     @staticmethod
     def _spec(
         attention=lambda *_args, **_kwargs: None,

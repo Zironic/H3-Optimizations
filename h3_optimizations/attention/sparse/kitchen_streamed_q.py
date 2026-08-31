@@ -29,7 +29,6 @@ from ...kitchen_qkv import (
     PRODUCER_ABI_VERSION,
     V_MODE_TWO_PASS,
     ChunkedKitchenQKVProjector,
-    FusedQKVError,
     _native_bf16_format,
     _project_anchor_samples,
     _quantize_q_chunk as _pack_q_chunk,
@@ -39,6 +38,7 @@ from ...kitchen_qkv import (
     resolve_kitchen,
 )
 from ...qkv.formats import describe_linear
+from ...qkv.fused_q import HeldExactH3FusedQ, fused_h3_q_supported
 from ...qkv.streamed import (
     PROJECTION_FORCE_BF16,
     PROJECTION_FORCE_FP8,
@@ -70,6 +70,7 @@ class StreamedSparseKitchenQKV:
     k_summary: torch.Tensor | None
     projection_mode: str
     output_buffer: torch.Tensor | None
+    fused_q: bool = False
 
     def release(self):
         self.module = None
@@ -79,6 +80,7 @@ class StreamedSparseKitchenQKV:
         self.carrier = None
         self.k_summary = None
         self.output_buffer = None
+        self.fused_q = False
 
 
 @dataclass
@@ -169,7 +171,7 @@ def _run_streamed_sparse_kitchen_qkv(
     layer_index,
     transformer_options,
 ):
-    del layer_index, transformer_options
+    del layer_index
     kitchen = resolve_kitchen(x.device)
     if kitchen is None or not _supports_streamed_producer(kitchen, x.device):
         return None
@@ -193,6 +195,11 @@ def _run_streamed_sparse_kitchen_qkv(
         return None
 
     sequence = int(x.shape[0])
+    projection_mode = _projection_mode(projector)
+    fused_q = bool(
+        q_tile == 64
+        and fused_h3_q_supported(module, x[:1], rope_freqs, projection_mode)
+    )
     shape = (1, int(module.heads), sequence, int(module.head_dim))
     q_shape = (1, int(module.heads), 1, int(module.head_dim))
     try:
@@ -211,7 +218,7 @@ def _run_streamed_sparse_kitchen_qkv(
     ):
         return None
 
-    held = create_held_qkv(module, x[:1], _projection_mode(projector))
+    held = create_held_qkv(module, x[:1], projection_mode)
     held.__enter__()
     try:
         with diagnostics.stage("anchor_projection"):
@@ -286,8 +293,9 @@ def _run_streamed_sparse_kitchen_qkv(
         rope_freqs=rope_freqs,
         carrier=carrier,
         k_summary=k_summary,
-        projection_mode=_projection_mode(projector),
+        projection_mode=projection_mode,
         output_buffer=x,
+        fused_q=fused_q,
     )
 
 
@@ -415,6 +423,11 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 "qkv_lifetime": "streamed_q_global_kitchen_kv",
                 "router_lifetime": "k_summary_q_slab_selection_lazy_kitchen_lut",
                 "attention_output": "chunked_out_proj_inplace",
+                "q_producer": (
+                    "h3_native_exact_128x256_fused"
+                    if projected.fused_q
+                    else "project_norm_rope_then_pack"
+                ),
             }
         )
         return PreparedStreamedSparseKitchen(
@@ -454,29 +467,66 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 "streamed Sparse Kitchen query rows must align to Q tiles"
             )
 
+        fused = None
         try:
-            for start in range(0, sequence, query_rows):
-                stop = min(start + query_rows, sequence)
-                held = create_held_qkv(
+            if projected.fused_q:
+                fused = HeldExactH3FusedQ(
                     projected.module,
-                    projected.x[start : start + 1],
+                    projected.x[:1],
+                    projected.rope_freqs,
                     projected.projection_mode,
                 )
-                held.__enter__()
-                try:
-                    q = project_q_hnd(
-                        held,
-                        projected.x,
-                        projected.rope_freqs,
-                        start,
-                        stop,
+                fused.__enter__()
+            full_k_length = (
+                int(projected.carrier.k.shape[-2]) if fused is not None else None
+            )
+            for start in range(0, sequence, query_rows):
+                stop = min(start + query_rows, sequence)
+                q_x = projected.x
+                q_rope = projected.rope_freqs
+                q_start = start
+                q_stop = stop
+                if fused is None:
+                    held = create_held_qkv(
+                        projected.module,
+                        q_x[q_start : q_start + 1],
+                        projected.projection_mode,
                     )
-                finally:
-                    held.__exit__(None, None, None)
-
+                    held.__enter__()
+                    try:
+                        q = project_q_hnd(
+                            held,
+                            q_x,
+                            q_rope,
+                            q_start,
+                            q_stop,
+                        )
+                    finally:
+                        held.__exit__(None, None, None)
+                    with diagnostics.stage("sparse_route"):
+                        q_summary = _tile_mean(q, q_tile)
+                    chunk_carrier = _quantize_q_chunk(
+                        producer_module,
+                        projected.carrier,
+                        q,
+                    )
+                    del q
+                else:
+                    packed_q, q_scale, q_summary = fused.project(
+                        q_x,
+                        q_rope,
+                        q_start,
+                        q_stop,
+                        full_k_length,
+                    )
+                    chunk_carrier = replace(
+                        projected.carrier,
+                        q=packed_q,
+                        q_scale=q_scale,
+                    )
+                    del packed_q, q_scale
                 tile_start = start // q_tile
                 with diagnostics.stage("sparse_route"):
-                    q_summary = _tile_mean(q, q_tile)
                     lut, counts = _build_route_chunk(
                         self.router,
                         prepared.route_plan,
@@ -484,12 +534,6 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         tile_start=tile_start,
                     )
                     del q_summary
-
-                chunk_carrier = _quantize_q_chunk(
-                    producer_module,
-                    projected.carrier,
-                    q,
-                )
                 route = kitchen.BlockSparseRoute(
                     indices=lut,
                     counts=counts,
@@ -497,7 +541,7 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                     kv_tile=int(self.executor.kv_tile),
                     encoding="delta",
                 )
-                del lut, counts, q
+                del lut, counts
 
                 with diagnostics.stage("sparse_attention_kernel"):
                     raw = kitchen.block_sparse_int8_attention_from_prequantized(
@@ -519,10 +563,14 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                 )
                 del raw
                 with diagnostics.stage("attention_out"):
-                    output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
+                    projected_rows = module.out_proj(flat.squeeze(0))
+                    output[start:stop].copy_(projected_rows)
+                    del projected_rows
                 del flat
             return output
         finally:
+            if fused is not None:
+                fused.__exit__(None, None, None)
             prepared.release()
 
 

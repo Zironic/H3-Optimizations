@@ -5,8 +5,9 @@
 // EXPERIMENTAL launcher for the block-sparse pure-INT8 attention kernel.
 //
 // Pinned to head_dim 128, non-causal, no attention mask. Production uses
-// 128Q x 128KV; exact 128Q x 64KV and 64Q x 64KV quality arms share the same
-// carrier and route ABI. No other template combinations are built.
+// 64Q x 64KV; exact 128Q x 128KV, 128Q x 64KV, and 64Q x 128KV quality arms
+// share the same carrier and route ABI. No other template combinations are
+// built.
 
 #include "qk_int_sv_i8_sparse_cuda.cuh"
 #include <algorithm>
@@ -103,8 +104,8 @@ void launch_sparse(
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
     int stride_bz_q_scale, int stride_h_q_scale, float sm_scale,
     int output_dtype_code, cudaStream_t stream) {
-  if (!((cta_q == 128 && (cta_k == 64 || cta_k == 128)) ||
-        (cta_q == 64 && cta_k == 64))) {
+  if (!((cta_q == 128 || cta_q == 64) &&
+        (cta_k == 128 || cta_k == 64))) {
     throw std::runtime_error(
         "sage_attn_sparse: unsupported geometry " + std::to_string(cta_q) +
         "Q x " + std::to_string(cta_k) + "KV");
@@ -152,6 +153,12 @@ void launch_sparse(
       LAUNCH_SPARSE(128, 64, half);
     } else {
       LAUNCH_SPARSE(128, 64, nv_bfloat16);
+    }
+  } else if (cta_k == 128) {
+    if (output_dtype_code == 1) {
+      LAUNCH_SPARSE(64, 128, half);
+    } else {
+      LAUNCH_SPARSE(64, 128, nv_bfloat16);
     }
   } else {
     if (output_dtype_code == 1) {

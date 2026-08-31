@@ -40,15 +40,17 @@ class NativeArchitectureBenchmarkTests(unittest.TestCase):
             252,
         )
 
-    def test_arm_matrix_has_dense_reference_and_three_geometries_per_density(self):
+    def test_arm_matrix_has_dense_reference_and_four_geometries_per_density(self):
         arms = bench.arm_specs([1.0, 0.3])
-        self.assertEqual(len(arms), 7)
+        self.assertEqual(len(arms), 9)
         self.assertEqual(arms[0], ('dense_128x128', 'dense', 1.0, 128, 128))
         self.assertEqual(
             {(arm[2], arm[3], arm[4]) for arm in arms[1:]},
             {
-                (1.0, 128, 128), (1.0, 128, 64), (1.0, 64, 64),
-                (0.3, 128, 128), (0.3, 128, 64), (0.3, 64, 64),
+                (1.0, 128, 128), (1.0, 128, 64),
+                (1.0, 64, 128), (1.0, 64, 64),
+                (0.3, 128, 128), (0.3, 128, 64),
+                (0.3, 64, 128), (0.3, 64, 64),
             },
         )
 

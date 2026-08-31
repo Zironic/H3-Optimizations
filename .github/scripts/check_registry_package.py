@@ -65,6 +65,8 @@ REQUIRED = (
     "native/frost/PROVENANCE",
     "native/LICENSE",
     "native/NOTICE.upstream",
+    "native/third_party/cutlass/LICENSE.txt",
+    "native/third_party/cutlass/PROVENANCE",
     "pyproject.toml",
     "README.md",
 )
@@ -109,6 +111,8 @@ def main():
     for relative in files:
         if relative.startswith("native/build") and "/bin/" not in relative:
             problems.append("local build output is being shipped: %s" % relative)
+        if relative.startswith("native/third_party/cutlass/include/"):
+            problems.append("CUTLASS build header is being shipped: %s" % relative)
 
     for relative in files:
         if not relative.endswith(".py"):

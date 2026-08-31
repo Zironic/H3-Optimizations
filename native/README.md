@@ -11,7 +11,7 @@ happened to the chunked QKV producer: fully integrated on this side, calling a
 Kitchen API that was never released, so every install silently fell back to
 standard projection at roughly half the speed.
 
-Two pieces are needed and neither is in 0.2.31:
+Four pieces are needed and none is in 0.2.31:
 
 - **the external INT8 attention producer**, which lets a chunked QKV
   projection quantize each chunk as it is produced rather than materializing
@@ -19,6 +19,9 @@ Two pieces are needed and neither is in 0.2.31:
 - **block-sparse KV traversal**, which walks a routed subset of the KV tiles.
 - **composable sparse softmax state**, which lets the same native traversal
   return its base-2 row normalizer for a separate rejected-tile residual.
+- **the exact H3 fused-Q producer**, which combines the ConvRot INT8 Q GEMM,
+  RMSNorm, RoPE, Kitchen Q packing, and 64-row routing summaries without a
+  full BF16 Q intermediate.
 
 ## Provenance
 
@@ -36,6 +39,12 @@ throw terminates the process instead of reaching the catch in the API layer.
 Upstream warns about this as C4297 on every build; here it was fatal until the
 linkage changed.
 
+The exact fused-Q kernel uses the C++ header tree from NVIDIA CUTLASS 4.6.0.
+Those headers and their BSD-3-Clause license are vendored under
+`third_party/cutlass`; they are build inputs only and introduce no runtime or
+Python-package dependency. The source revision is recorded in
+`third_party/cutlass/PROVENANCE`.
+
 ## The API boundary
 
 `src/h3_int8_attention_api.cu` is the stable surface. Every entry point is
@@ -51,11 +60,19 @@ cp311 and abi3 builds.
 ABI 4 adds Q-only carrier packing with the global K length kept as transform
 dispatch metadata, without allocating or rewriting a dummy K carrier. ABI 3
 added explicit sparse Q geometry and Q-scale strides. It exposes exact
-128Q x 64KV and 64Q x 64KV traversal without changing Kitchen's Q128
-quantization carrier. ABI 2 added `h3_int8_sparse_attention_lse`; that output
+128Q x 128KV, 128Q x 64KV, 64Q x 128KV, and 64Q x 64KV traversal without
+changing Kitchen's Q128 quantization carrier. ABI 2 added
+`h3_int8_sparse_attention_lse`; that output
 remains one FP32 base-2 log-sum-exp value per query row. The packaged Windows
 DLL is build-versioned so a running Comfy process can keep an older mapped DLL
 until the next normal restart.
+
+ABI 4 also accepts the additive
+`h3_int8_quantize_bf16_rowwise_convrot256` and `h3_int8_fused_q` symbols. They
+are optional when loading an older ABI-4 binary, so unsupported installs keep
+the established Q projection and packing path. The fixed exact 128x256 fused-Q
+kernel is selected only on SM80 or newer; this does not change the SM75 support
+of the existing attention kernels.
 
 ## Building
 
@@ -100,6 +117,6 @@ rejects a binary built against a newer libstdc++ ABI. CUDA fatbins use size
 compression, unused ELF sections are discarded, and the final shared library
 is stripped while retaining its exported C ABI.
 
-There is no CUTLASS, cuBLAS or flash-attention dependency — the vendored subset
-needs only the CUDA toolkit, which is what makes a single fat multi-architecture
-binary practical.
+CUTLASS is vendored as compile-time headers. There is no external CUTLASS,
+cuBLAS, flash-attention, or Python runtime dependency; the shipped shared
+library needs only the CUDA runtime and driver already required by ComfyUI.

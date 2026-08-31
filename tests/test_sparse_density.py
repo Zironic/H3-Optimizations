@@ -168,6 +168,7 @@ def test_node_schema_and_request():
         result.args[0] is patched
         and request.video_budget == 0.5
         and request.backend == 'auto'
+        and request.video_token_order == '1x8x8'
         and request.denser_early_late_steps is True
         and request.advanced_schedule is False,
         'standard node carries the simple denser-step policy',
@@ -187,6 +188,7 @@ def test_advanced_node_schema_and_request():
             'late_kv',
             'backend',
             'early_schedule',
+            'video_token_order',
         ],
         'advanced schema exposes only production sparse controls',
     )
@@ -196,6 +198,7 @@ def test_advanced_node_schema_and_request():
         and backend.options
         == [
             'Kitchen INT8',
+            'Kitchen INT8 64x128 (experimental)',
             'FROST BF16 (SM89)',
             'Sparse Sage',
             'BF16 Triton',
@@ -210,7 +213,8 @@ def test_advanced_node_schema_and_request():
         and input_by_id(schema, 'late_steps').default == 0
         and input_by_id(schema, 'late_kv').default == 0.5
         and input_by_id(schema, 'early_schedule').default == 'Hold'
-        and input_by_id(schema, 'early_schedule').options == ['Hold', 'Ramp'],
+        and input_by_id(schema, 'early_schedule').options == ['Hold', 'Ramp']
+        and input_by_id(schema, 'video_token_order').default == '1x8x8',
         'advanced early and late defaults match the public contract',
     )
 
@@ -240,6 +244,7 @@ def test_advanced_node_schema_and_request():
         and request.late_steps == 4
         and request.late_kv == 0.7
         and request.early_schedule == 'Ramp'
+        and request.video_token_order == '1x8x8'
         and request.denser_early_late_steps is False,
         'advanced node carries the explicit schedule and production TopK routing',
     )

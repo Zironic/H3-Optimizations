@@ -77,6 +77,8 @@ STAGE_NAMES = (
     'qkv_producer_total',
     'qkv_linear',
     'qk_norm_rope',
+    'q_activation_quant',
+    'fused_q_projection',
     'anchor_projection',
     'anchor_selection',
     'producer_create',

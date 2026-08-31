@@ -16,7 +16,7 @@ if str(PACK_ROOT) not in sys.path:
     sys.path.insert(0, str(PACK_ROOT))
 
 
-GEOMETRIES = ((128, 128), (128, 64), (64, 64))
+GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64))
 
 
 @dataclass(frozen=True)
@@ -185,7 +185,9 @@ def parse_capability(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='Benchmark native 128x128, 128x64, and 64x64 INT8 attention.'
+        description=(
+            'Benchmark native 128x128, 128x64, 64x128, and 64x64 INT8 attention.'
+        )
     )
     parser.add_argument('--expected-capability', type=parse_capability)
     parser.add_argument('--sequence', type=int, default=54_006)

@@ -4,9 +4,8 @@
 # in h3_int8_attention_api.cu is that Python reaches it through ctypes, so
 # nothing here links against Python and one binary serves every interpreter.
 #
-# No CUTLASS, no cuBLAS, no flash-attention: the vendored INT8 attention subset
-# depends on nothing but the CUDA toolkit, which is what makes a single fat
-# multi-architecture binary practical.
+# CUTLASS is vendored as headers under native/third_party. The resulting shared
+# library still has no external runtime dependency beyond the CUDA toolkit.
 
 cmake_minimum_required(VERSION 3.26)
 project(h3_int8_attention LANGUAGES CXX CUDA)
@@ -45,6 +44,8 @@ set(CMAKE_CUDA_ARCHITECTURES ${H3_CUDA_ARCHS})
 
 add_library(h3_int8_attention SHARED
     src/h3_int8_attention_api.cu
+    src/convrot_quantize.cu
+    src/h3_fused_q_cutlass.cu
     src/sage_attention/sage_attn_launcher.cu
     src/sage_attention/sage_attn_sparse_launcher.cu
     src/sage_attention/quant_qk_int8.cu
@@ -55,6 +56,7 @@ add_library(h3_int8_attention SHARED
 target_include_directories(h3_int8_attention PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sage_attention
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include
 )
 
 target_compile_options(h3_int8_attention PRIVATE
@@ -89,6 +91,7 @@ endif()
 if(MSVC)
     target_compile_options(h3_int8_attention PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHs>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
         $<$<COMPILE_LANGUAGE:CXX>:/EHs>
     )
     # CMake puts /EHsc in both host and CUDA-host defaults. Strip both so a

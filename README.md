@@ -37,12 +37,12 @@ control:
 | --- | --- | --- |
 | **H3 Memory Optimization** | Reduces peak VRAM use during H3 generation | Add it and leave the defaults alone |
 | **H3 Sparse Attention** | Makes H3 faster by calculating less video attention | Use it when speed matters and you accept a quality/speed tradeoff |
-| **H3 Sparse Attention (Advanced)** | Gives manual control over sparse-attention scheduling and backend selection | Use only when you know why you need the extra controls |
+| **H3 Sparse Attention (Advanced)** | Gives manual control over sparse scheduling, backend, and token order | Use only when you know why you need the extra controls |
 | **H3 AIMDO Residency Limiter** | Manually controls how much of the H3 model DynamicVRAM keeps persistently resident in VRAM | Mainly for benchmarking, debugging AIMDO, or deliberately forcing low residency |
 
-The **H3-Optimizations production nodes are order-independent with each other**.
-You do not need to worry about whether Memory Optimization comes before or after
-Sparse Attention.
+H3 Memory Optimization, AIMDO Residency Limiter, and Sparse Attention are
+order-independent with each other. Sparse Attention owns its target-video token
+order and composes it with the selected embedding-memory path automatically.
 
 Compatible external attention and `ModelPatcher` changes are preserved where
 supported. A conflicting third-party patch can disable the corresponding H3
@@ -145,6 +145,22 @@ whole video KV tile, while values above it saturate at the full video route.
 Text, reference conditioning, audio, non-video queries, and mixed boundary tiles
 remain dense.
 
+The normal node uses the measured **1x8x8** target-video order. It groups real
+tokens into router-aligned 64-token spatial tiles through every H3 DiT block and
+restores raster order at the model output. This is backend-neutral and needs no
+separate token-order node.
+
+For native ConvRot-256 INT8 H3 checkpoints on SM80 or newer, the standard
+Kitchen 64x64 path now uses the H3-owned exact 128x256 fused-Q producer by
+default. The 128x256 dimensions describe the Q projection kernel, not the
+attention route: routing and sparse attention remain 64Q x 64KV. Its measured
+production boundary was approximately speed-neutral while reducing the active
+allocator peak when two-pass V was enabled. Older GPUs, other weight formats,
+older native binaries, and devices that fail the one-time fused-Q parity
+self-test keep the established Q projection and packing path.
+The implementation and its CUTLASS build headers ship in this repository; it
+does not require H3-Extended or a patched Comfy Kitchen checkout.
+
 > **Sparse attention changes model computation. It is not free acceleration.**
 > There is no attention percentage that is guaranteed to be lossless for every
 > prompt. H3 is especially sensitive to reducing attention in the early sampling
@@ -165,8 +181,8 @@ drop from a short dense prefix to the low budget.
 on.**
 
 The Advanced node exposes separate attention budgets for the beginning, middle,
-and end of sampling, an early-schedule shape, and an explicit sparse-backend
-selector.
+and end of sampling, an early-schedule shape, an explicit sparse-backend
+selector, and target-video token order.
 
 - **Video attention budget** controls the middle steps.
 - **Early schedule** selects **Hold** or **Ramp**. Hold keeps Early KV fixed for
@@ -179,6 +195,12 @@ selector.
 - If the early and late windows overlap, the denser requested budget wins.
 - **Sparse backend** lets you explicitly select Kitchen INT8, FROST BF16,
   Sparse Sage, BF16 Triton, or FP8 FlexAttention.
+- **Video token order** defaults to **1x8x8**. The measured **1x16x4** and
+  **4x4x4** geometries remain available as comparison arms, and **Raster (stock
+  H3 order)** provides the unchanged H3 ordering baseline.
+- **Kitchen INT8 64x128 (experimental)** is an explicit image-quality arm that
+  keeps 64-row query routing while selecting 128-row KV tiles. Ordinary
+  Kitchen INT8 remains the 64x64 default.
 
 The defaults preserve the existing **Hold** behavior: four early steps at 50%,
 a 15% middle budget, and no late override, matching a 20-step schedule. Choose
@@ -510,7 +532,7 @@ composition, backend classification, streamed and chunked projection contracts,
 FROST ABI behavior, native shipping contracts, explicit sparse-backend
 selection, chunk boundaries and RoPE slices, non-H3 no-op behavior, sparse route
 geometry, runtime step/layout publication, early/middle/late density schedules,
-and source isolation.
+cube-order permutations and plan composition, and source isolation.
 
 GPU kernel validation is intentionally separate because it requires matching
 hardware and compiled backend packages.

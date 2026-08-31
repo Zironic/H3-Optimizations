@@ -120,6 +120,15 @@ def run_prepare_wrappers(model):
 
 
 class ApplyCompositionTests(unittest.TestCase):
+    def setUp(self):
+        cube_install = mock.patch.object(
+            apply_module,
+            'install_cube_order',
+            return_value=True,
+        )
+        self.install_cube_order = cube_install.start()
+        self.addCleanup(cube_install.stop)
+
     def test_live_option_sync_is_a_no_op_for_the_patcher_options_object(self):
         wrapper = lambda executor, *args, **kwargs: executor(*args, **kwargs)
         model = FakeModel({
@@ -582,6 +591,8 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertFalse(status['runtime_installed'])
         self.assertIn('Attention: existing', format_sparse_status(patched))
         self.assertIn('Sparse fallback:', format_sparse_status(patched))
+        self.assertIn('Video token order: 1x8x8', format_sparse_status(patched))
+        self.install_cube_order.assert_called_once_with(patched, (1, 8, 8))
         configure.assert_not_called()
         sparse_runtime.assert_not_called()
 

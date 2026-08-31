@@ -1,1 +1,6 @@
 PROVENANCE: c6b7ba49ab219c7c1236089b0c8908ea671993ee
+
+h3_fused_q_cutlass.cu was adapted from the Exact 128x256 H3 fused-Q
+experimental patch developed against that ComfyKitchen revision. Its CUTLASS
+headers are vendored from NVIDIA CUTLASS 4.6.0 commit
+d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39.

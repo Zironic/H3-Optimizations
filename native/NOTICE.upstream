@@ -23,6 +23,17 @@ NVIDIA permits redistribution of the CUDA runtime libraries as part of applicati
 that use the CUDA toolkit, provided that proper attribution is included.
 
 --------------------------------------------------------------------------------
+NVIDIA CUTLASS
+--------------------------------------------------------------------------------
+Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: BSD-3-Clause
+Website: https://github.com/NVIDIA/cutlass
+
+The C++ header tree from CUTLASS 4.6.0 is vendored under
+native/third_party/cutlass. The separately licensed CuTe DSL Python package is
+not included.
+
+--------------------------------------------------------------------------------
 PyTorch
 --------------------------------------------------------------------------------
 Copyright (c) 2016-present, Meta Platforms, Inc. and PyTorch contributors

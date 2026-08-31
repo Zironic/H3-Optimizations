@@ -27,7 +27,7 @@ OUTPUT_LAYOUTS = (OUTPUT_HND, OUTPUT_NHD)
 Q_TILE = 128
 CTA_K = 64
 LARGE_CTA_K = 128
-SPARSE_GEOMETRIES = ((128, 128), (128, 64), (64, 64))
+SPARSE_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64))
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 # Matches the CUDA backend's conventions; do not renumber.

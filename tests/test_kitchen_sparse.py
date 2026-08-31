@@ -143,7 +143,7 @@ def test_router_geometry_must_match_the_kernel():
         SparseKitchenBackend(kitchen=object(), router=mismatched)
 
 
-@pytest.mark.parametrize('q_tile,kv_tile', [(128, 64), (64, 64)])
+@pytest.mark.parametrize('q_tile,kv_tile', [(128, 64), (64, 128), (64, 64)])
 def test_exact_quality_geometry_reaches_router_executor_and_status(q_tile, kv_tile):
     backend = SparseKitchenBackend(
         kitchen=object(),

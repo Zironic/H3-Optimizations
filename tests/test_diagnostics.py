@@ -83,6 +83,8 @@ class StageCoverageTests(unittest.TestCase):
         'attention_out': 'attention_forward.py',
         'qkv_linear': 'attention_forward.py',
         'qk_norm_rope': 'attention_forward.py',
+        'q_activation_quant': 'qkv/fused_q.py',
+        'fused_q_projection': 'qkv/fused_q.py',
         'qkv_producer_total': 'kitchen_qkv.py',
         'anchor_projection': 'kitchen_qkv.py',
         'routing_summary_generation': 'kitchen_qkv.py',

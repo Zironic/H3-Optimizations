@@ -488,7 +488,7 @@
       ],
       "size": [
         400,
-        320
+        370
       ],
       "flags": {},
       "order": 10,
@@ -521,7 +521,9 @@
         0.5,
         0,
         0.5,
-        "Kitchen INT8"
+        "Kitchen INT8",
+        "Hold",
+        "1x8x8"
       ],
       "widgets_values_named": {
         "video_budget": 0.15,
@@ -529,7 +531,9 @@
         "early_kv": 0.5,
         "late_steps": 0,
         "late_kv": 0.5,
-        "backend": "Kitchen INT8"
+        "backend": "Kitchen INT8",
+        "early_schedule": "Hold",
+        "video_token_order": "1x8x8"
       }
     },
     {

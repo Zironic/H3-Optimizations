@@ -11,12 +11,14 @@ from .plan import (
     DEFAULT_EDGE_STEPS,
     DEFAULT_LATE_STEPS,
     DEFAULT_VIDEO_BUDGET,
+    DEFAULT_VIDEO_TOKEN_ORDER,
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_OPTIONS,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
+    VIDEO_TOKEN_ORDER_REQUESTS,
     read_plan,
 )
 from .status import (
@@ -73,7 +75,8 @@ class H3SparseAttention(io.ComfyNode):
                 'change motion/detail, or otherwise change the generated result; '
                 'no percentage is lossless for every prompt. Text, reference '
                 'conditioning, audio, non-video queries, and mixed boundary tiles '
-                'remain dense. Backend auto prefers native Kitchen INT8, then '
+                'remain dense. Target-video tokens use the measured 1x8x8 '
+                'router-aligned order. Backend auto prefers native Kitchen INT8, then '
                 'Sparse Sage, BF16 Triton, FP8 FlexAttention, and finally the '
                 'resolved dense attention path.'
             ),
@@ -114,6 +117,7 @@ class H3SparseAttention(io.ComfyNode):
             SparseRequest(
                 video_budget=float(video_budget),
                 denser_early_late_steps=bool(denser_early_late_steps),
+                video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
             )
         )
         patched = apply_plan(model, plan)
@@ -140,7 +144,8 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 'Advanced fixed-density sparse attention for MiniMax H3. '
                 'Video attention budget controls middle sampling steps. Early KV '
                 'can be held or ramped toward that budget; Late KV overrides the '
-                'final configured step count. '
+                'final configured step count. Video token order defaults to the '
+                'measured 1x8x8 geometry and can be restored to stock raster order. '
                 'Lower budgets are faster but can change the generated result, and '
                 'the quality cost depends on the prompt and where attention is '
                 'removed in the denoising schedule. Kitchen INT8 64x64 is the '
@@ -218,6 +223,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
                         'Kitchen INT8 uses the shipped native 64Q x 64KV path. '
+                        'Kitchen INT8 64x128 is an experimental image-quality '
+                        'arm with the same 64-row query routing but coarser '
+                        '128-row KV selections. '
                         'FROST BF16 uses 64Q x 64KV routing and is available '
                         'only on SM89. '
                         'BF16 Triton and FP8 FlexAttention use the same 64Q x '
@@ -240,6 +248,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'steps. Set Early steps to 0 to disable either schedule.'
                     ),
                 ),
+                io.Combo.Input(
+                    'video_token_order',
+                    display_name='Video token order',
+                    options=list(VIDEO_TOKEN_ORDER_REQUESTS),
+                    default=DEFAULT_VIDEO_TOKEN_ORDER,
+                    tooltip=(
+                        '1x8x8 is the measured default and groups each 64-token '
+                        'router tile as temporal x height x width. The other '
+                        '64-token geometries are experimental comparison arms. '
+                        'Raster restores unchanged H3 target-video ordering.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -255,6 +275,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_kv=DEFAULT_EDGE_KV,
         backend=SPARSE_BACKEND_KITCHEN,
         early_schedule=EARLY_SCHEDULE_HOLD,
+        video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
         plan = read_plan(model).with_sparse(
             SparseRequest(
@@ -265,6 +286,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 late_kv=float(late_kv),
                 backend=backend,
                 early_schedule=early_schedule,
+                video_token_order=video_token_order,
             )
         )
         patched = apply_plan(model, plan)
@@ -283,11 +305,14 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         early_kv=DEFAULT_EDGE_KV,
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
+        video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
         if backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
         if early_schedule not in EARLY_SCHEDULE_OPTIONS:
             return 'unknown early schedule %r' % early_schedule
+        if video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
+            return 'unknown video token order %r' % video_token_order
         for name, value in (
             ('video_budget', video_budget),
             ('early_kv', early_kv),

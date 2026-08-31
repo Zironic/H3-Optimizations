@@ -60,6 +60,8 @@ class NativeShippingTests(unittest.TestCase):
         # BUILD_ID passes every size and magic-number check above. Assert the
         # entry points the Python bindings dlsym at runtime are really present.
         required = (
+            b'h3_int8_fused_q',
+            b'h3_int8_quantize_bf16_rowwise_convrot256',
             b'h3_int8_quantize_q_chunk',
             b'h3_int8_quantize_v',
             b'h3_int8_v_amax_chunk',

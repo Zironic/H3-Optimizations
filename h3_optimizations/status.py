@@ -362,6 +362,10 @@ def format_sparse_status(model):
 
     lines = [
         attention_line,
+        'Video token order: %s' % (
+            sparse.get('video_token_order')
+            or getattr(plan_sparse, 'video_token_order', 'unknown')
+        ),
         'Requested video KV budget: %.1f%%' % (float(budget) * 100.0),
         'QKV: %s' % format_qkv_execution(status),
         (
@@ -375,8 +379,13 @@ def format_sparse_status(model):
         lines.insert(1, 'Sparse fallback: %s' % reason)
     step_budgets = sparse.get('step_video_budgets')
     if step_budgets:
+        budget_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith('Requested video KV budget:')
+        )
         lines.insert(
-            2,
+            budget_index + 1,
             'Per-step benchmark schedule: %s'
             % ', '.join('%.0f%%' % (value * 100.0) for value in step_budgets),
         )

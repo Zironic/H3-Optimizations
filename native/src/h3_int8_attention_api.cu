@@ -19,9 +19,11 @@
 // single binary serves every Python that can call ctypes.
 
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -93,6 +95,16 @@ void launch_quant_q_per_thread_int8_into(
     int full_Lq, int q_start, int C, int full_Lk, int64_t q_stride_b,
     int64_t q_stride_h, int64_t q_stride_n, int input_dtype_code,
     cudaStream_t stream);
+
+void launch_h3_quantize_bf16_rowwise_convrot256(
+    const void *input, void *output, void *scales, int64_t rows,
+    int64_t columns, cudaStream_t stream);
+
+bool launch_h3_fused_q_cutlass(
+    const void *a, const void *b, const void *x_scale,
+    const void *weight_scale, const void *norm, const void *freqs, void *debug,
+    void *summary, void *q, void *q_scale, int64_t m, int64_t n, int64_t k,
+    int full_k_length, float epsilon, cudaStream_t stream);
 
 void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
                                 int H, int N, int D, int padded_N, int64_t sb,
@@ -260,6 +272,43 @@ H3_API int h3_int8_quantize_q_chunk(
       q, q_int8, q_scale, B, H_q, Lq, full_Lq, q_start, C, full_Lk,
       q_stride_b, q_stride_h, q_stride_n, input_dtype_code,
       reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_quantize_bf16_rowwise_convrot256(
+    const void *input, void *output, void *scales, int64_t rows,
+    int64_t columns, uintptr_t stream) noexcept {
+  H3_GUARD(launch_h3_quantize_bf16_rowwise_convrot256(
+      input, output, scales, rows, columns,
+      reinterpret_cast<cudaStream_t>(stream)))
+}
+
+H3_API int h3_int8_fused_q(
+    const void *activation, const void *weight, const void *activation_scale,
+    const void *weight_scale, const void *norm, const void *freqs,
+    void *summary, void *q, void *q_scale, int64_t rows, int64_t outputs,
+    int64_t hidden, int full_k_length, float epsilon,
+    uintptr_t stream) noexcept {
+  H3_GUARD({
+    if (!activation || !weight || !activation_scale || !weight_scale ||
+        !norm || !freqs || !summary || !q || !q_scale) {
+      throw std::runtime_error("fused H3 Q received a null pointer");
+    }
+    if (rows <= 0 || outputs <= 0 || hidden <= 0 ||
+        rows > std::numeric_limits<int>::max() - 127 ||
+        outputs > std::numeric_limits<int>::max() ||
+        hidden > std::numeric_limits<int>::max() || full_k_length <= 0 ||
+        !std::isfinite(epsilon) || epsilon <= 0.0f) {
+      throw std::runtime_error("fused H3 Q received invalid geometry");
+    }
+    if (!launch_h3_fused_q_cutlass(
+            activation, weight, activation_scale, weight_scale, norm, freqs,
+            nullptr, summary, q, q_scale, rows, outputs, hidden,
+            full_k_length, epsilon,
+            reinterpret_cast<cudaStream_t>(stream))) {
+      throw std::runtime_error(
+          "exact 128x256 CUTLASS H3 Q kernel rejected the request");
+    }
+  })
 }
 
 H3_API int h3_int8_quantize_v(const void *v, void *out, void *scale, int B, int H,

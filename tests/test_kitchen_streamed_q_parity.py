@@ -148,7 +148,7 @@ class KitchenStreamedQParityTests(unittest.TestCase):
     def test_streamed_q_full_route_matches_whole_carrier_output(self):
         sequence = 640
         q, k, v = _samples(sequence, 20260852)
-        for q_tile, kv_tile in ((128, 64), (64, 64), (128, 128)):
+        for q_tile, kv_tile in ((128, 64), (64, 128), (64, 64), (128, 128)):
             with self.subTest(q_tile=q_tile, kv_tile=kv_tile):
                 whole = native.prequantize_int8_attention(
                     q,

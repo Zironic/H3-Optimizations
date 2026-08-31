@@ -30,6 +30,12 @@ from .attention.sparse import (
 from .attention.sparse.fused_qkv import (
     TRITON_AVAILABLE as SPARSE_TRITON_AVAILABLE,
 )
+from .attention.sparse.existing_dense_sparse import (
+    ExistingDenseSparseBackend,
+    ExistingDenseSparseError,
+    ExistingDenseSparseQKVProjector,
+    probe_existing_dense_sparse,
+)
 from .attention.sparse.kitchen_sparse import (
     OUTPUT_NHD,
     PRODUCTION_KV_TILE as KITCHEN_KV_TILE,
@@ -37,6 +43,11 @@ from .attention.sparse.kitchen_sparse import (
     SparseKitchenBackend,
     SparseKitchenError,
     preflight_sparse_kitchen,
+)
+from .cube_order import (
+    TOKEN_ORDER_SHAPES,
+    clear as clear_cube_order,
+    install as install_cube_order,
 )
 from .dense_resolver import (
     ATTENTION_COMFY_KITCHEN_INT8,
@@ -73,6 +84,7 @@ from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
+    FUSED_QKV_PRESERVE_BF16,
     EMBEDDING_MEMORY_RELEASE,
     EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
@@ -82,6 +94,7 @@ from .plan import (
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_FROST,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X128,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
     STATUS_KEY,
@@ -137,12 +150,14 @@ LOG_PREFIX = '[H3 Optimizations]'
 CLONE_CALLBACK_KEY = 'h3_optimizations_plan_clone'
 PREPARE_WRAPPER_KEY = 'h3_optimizations_finalize_plan'
 ATTENTION_SPARSE = 'sparse_sage'
+ATTENTION_EXISTING_SPARSE = 'existing_dense_sparse'
 ATTENTION_TRITON_SPARSE = 'triton_sparse_bf16'
 ATTENTION_FP8_FLEX = 'flex_attention_fp8'
 ATTENTION_FROST_BF16 = 'frost_bf16_sm89'
 ATTENTION_KITCHEN_SPARSE = 'sparse_kitchen_int8'
 SPARSE_EXECUTION_BACKENDS = (
     ATTENTION_SPARSE,
+    ATTENTION_EXISTING_SPARSE,
     ATTENTION_TRITON_SPARSE,
     ATTENTION_FP8_FLEX,
     ATTENTION_FROST_BF16,
@@ -165,6 +180,7 @@ def _attention_summary_name(attention):
         ATTENTION_COMFY_KITCHEN_INT8: 'Comfy Kitchen INT8',
         ATTENTION_EXISTING: 'existing ComfyUI attention',
         ATTENTION_SPARSE: 'Sparse Sage',
+        ATTENTION_EXISTING_SPARSE: 'Existing Dense Sparse',
         ATTENTION_TRITON_SPARSE: 'BF16 Triton Sparse',
         ATTENTION_FP8_FLEX: 'FP8 FlexAttention',
         ATTENTION_FROST_BF16: 'FROST BF16',
@@ -500,6 +516,126 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
 
 
+def _resolve_existing_dense_sparse(
+    plan,
+    model,
+    inventory,
+    environment,
+    dense_attention,
+    dense_qkv,
+):
+    options = getattr(model, 'model_options', {}).get(
+        'transformer_options',
+        {},
+    )
+    try:
+        if not bool(getattr(environment, 'cuda_available', False)):
+            raise ExistingDenseSparseError('CUDA or ROCm is unavailable')
+        index = getattr(environment, 'device_index', None)
+        device = torch.device('cuda' if index is None else 'cuda:%d' % int(index))
+        execution_dtype = model.get_model_object('manual_cast_dtype')
+        if execution_dtype is None:
+            execution_dtype = model.model.get_dtype_inference()
+        spec = probe_existing_dense_sparse(
+            options,
+            device=device,
+            dtype=execution_dtype,
+        )
+        qkv_request = _qkv_request(plan)
+        if execution_dtype != torch.bfloat16 and qkv_request in (
+            FUSED_QKV_AUTO,
+            FUSED_QKV_OFF,
+            FUSED_QKV_PRESERVE_BF16,
+        ):
+            qkv = QKVProviderResolution(
+                QKV_STANDARD,
+                False,
+                'standard QKV preserves %s H3 execution for existing-dense sparse attention'
+                % execution_dtype,
+            )
+        else:
+            qkv = resolve_qkv_provider(
+                inventory,
+                request=qkv_request,
+                backend_kind=ATTENTION_EXISTING,
+                triton_available=True,
+                memory_optimize=plan.memory is not None,
+                fp8_available=_fp8_execution_available(environment),
+            )
+        projector = None
+        if qkv.provider_id in (
+            QKV_BF16_CHUNKED,
+            QKV_FORCE_BF16_CHUNKED,
+            QKV_FORCE_CONVROT_INT8_CHUNKED,
+        ):
+            if execution_dtype != torch.bfloat16:
+                raise ExistingDenseSparseError(
+                    'requested streamed QKV requires BF16 H3 execution, got %s'
+                    % execution_dtype
+                )
+            projector = ExistingDenseSparseQKVProjector(
+                required=bool(qkv.fused),
+                chunk_rows=(
+                    4096
+                    if plan.memory is None
+                    else _effective_qkv_chunk_rows(plan.memory.chunk_rows)
+                ),
+                projection_mode=_streamed_projection_mode(qkv, inventory),
+            )
+        backend = ExistingDenseSparseBackend(
+            HybridSparseConfig(
+                mode=MODE_SAGE128,
+                **_sparse_config_kwargs(plan),
+            ),
+            spec=spec,
+        )
+        return (
+            ResolvedAttention(
+                requested=ATTENTION_SPARSE,
+                selected=ATTENTION_EXISTING_SPARSE,
+                backend=backend,
+                reason=(
+                    '%s; sparse routing uses the existing dense attention '
+                    'consumer over packed %dQ x %dKV %s routes'
+                    % (
+                        dense_attention.reason,
+                        spec.q_tile,
+                        spec.kv_tile,
+                        spec.dtype,
+                    )
+                ),
+                backend_kind=ATTENTION_EXISTING_SPARSE,
+                projector=projector,
+                dense_resolution=dense_attention.dense_resolution,
+            ),
+            qkv,
+        )
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as error:
+        logging.debug(
+            '%s existing-dense sparse fallback unavailable: %s: %s',
+            LOG_PREFIX,
+            type(error).__name__,
+            error,
+        )
+        return (
+            ResolvedAttention(
+                requested=dense_attention.requested,
+                selected=dense_attention.selected,
+                backend=dense_attention.backend,
+                reason=(
+                    '%s; existing-dense sparse unavailable: %s: %s'
+                    % (dense_attention.reason, type(error).__name__, error)
+                ),
+                backend_kind=dense_attention.backend_kind,
+                projector=dense_attention.projector,
+                dense_resolution=dense_attention.dense_resolution,
+            ),
+            dense_qkv,
+        )
+
+
 def _resolve_sparse(plan, environment, inventory):
     kernel_spec = preflight_sparse_sage(
         cuda_available=lambda: environment.cuda_available,
@@ -717,13 +853,20 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
     )
 
 
-def _resolve_kitchen_sparse(plan, environment, inventory):
+def _resolve_kitchen_sparse(
+    plan,
+    environment,
+    inventory,
+    *,
+    q_tile=KITCHEN_Q_TILE,
+    kv_tile=KITCHEN_KV_TILE,
+):
     """Explicit Kitchen block-sparse INT8, with no Sparge anywhere in it."""
     kitchen = preflight_sparse_kitchen(
         cuda_available=lambda: environment.cuda_available,
         capability_getter=lambda: environment.capability,
-        q_tile=KITCHEN_Q_TILE,
-        kv_tile=KITCHEN_KV_TILE,
+        q_tile=q_tile,
+        kv_tile=kv_tile,
     )
     qkv = resolve_qkv_provider(
         inventory,
@@ -753,8 +896,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
                 qkv.provider_id == QKV_FORCE_BF16_STREAMED_KITCHEN
             ),
             routing_summaries=True,
-            q_tile=KITCHEN_Q_TILE,
-            kv_tile=KITCHEN_KV_TILE,
+            q_tile=q_tile,
+            kv_tile=kv_tile,
             strided_qk_input=True,
             stream_output=True,
             convrot_int8_projection=(
@@ -775,8 +918,8 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         config,
         kitchen=kitchen,
         projector=projector,
-        q_tile=KITCHEN_Q_TILE,
-        kv_tile=KITCHEN_KV_TILE,
+        q_tile=q_tile,
+        kv_tile=kv_tile,
         output_layout=OUTPUT_NHD,
         release_carrier_before_out_proj=True,
         stream_output=use_projected,
@@ -786,7 +929,10 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             requested=ATTENTION_KITCHEN_SPARSE,
             selected=ATTENTION_KITCHEN_SPARSE,
             backend=backend,
-            reason='native Kitchen INT8 64Q x 64KV sparse attention',
+            reason=(
+                'native Kitchen INT8 %dQ x %dKV sparse attention'
+                % (q_tile, kv_tile)
+            ),
             backend_kind=ATTENTION_KITCHEN_SPARSE,
             projector=projector,
         ),
@@ -808,25 +954,42 @@ def _resolve_attention(plan, model, inventory, environment):
     ):
         if plan.memory is None:
             dense = resolve_current_dense_attention(model, environment)
+            dense_attention = ResolvedAttention(
+                requested=ATTENTION_SPARSE,
+                selected=dense.selected,
+                backend=None,
+                reason='preserved an explicit external attention override',
+                backend_kind=dense.backend_kind,
+                dense_resolution=dense,
+            )
+            dense_qkv = QKVProviderResolution(
+                QKV_STANDARD,
+                False,
+                'standard QKV preserves the explicit external attention consumer',
+            )
+            if plan.sparse.backend == SPARSE_BACKEND_AUTO:
+                return _resolve_existing_dense_sparse(
+                    plan,
+                    model,
+                    inventory,
+                    environment,
+                    dense_attention,
+                    dense_qkv,
+                )
             return (
                 ResolvedAttention(
-                    requested=ATTENTION_SPARSE,
-                    selected=dense.selected,
-                    backend=None,
+                    requested=dense_attention.requested,
+                    selected=dense_attention.selected,
+                    backend=dense_attention.backend,
                     reason=(
                         'preserved an explicit external attention override; '
                         'sparse attention is disabled because the consumer '
                         'does not expose an H3 sparse composition contract'
                     ),
-                    backend_kind=dense.backend_kind,
-                    dense_resolution=dense,
+                    backend_kind=dense_attention.backend_kind,
+                    dense_resolution=dense_attention.dense_resolution,
                 ),
-                QKVProviderResolution(
-                    QKV_STANDARD,
-                    False,
-                    'standard QKV preserves the explicit external attention '
-                    'consumer',
-                ),
+                dense_qkv,
             )
         dense_attention, dense_qkv = _resolve_dense(
             plan,
@@ -834,6 +997,15 @@ def _resolve_attention(plan, model, inventory, environment):
             inventory,
             environment,
         )
+        if plan.sparse.backend == SPARSE_BACKEND_AUTO:
+            return _resolve_existing_dense_sparse(
+                plan,
+                model,
+                inventory,
+                environment,
+                dense_attention,
+                dense_qkv,
+            )
         return (
             ResolvedAttention(
                 requested=ATTENTION_SPARSE,
@@ -859,6 +1031,14 @@ def _resolve_attention(plan, model, inventory, environment):
             return _resolve_triton_sparse(plan, environment, inventory, None)
         if backend_request == SPARSE_BACKEND_KITCHEN:
             return _resolve_kitchen_sparse(plan, environment, inventory)
+        if backend_request == SPARSE_BACKEND_KITCHEN_64X128:
+            return _resolve_kitchen_sparse(
+                plan,
+                environment,
+                inventory,
+                q_tile=64,
+                kv_tile=128,
+            )
         if backend_request == SPARSE_BACKEND_FLEX:
             return _resolve_fp8_flex(
                 plan,
@@ -1046,6 +1226,7 @@ def _status(
                 'late_steps': plan.sparse.late_steps,
                 'late_kv': plan.sparse.late_kv,
                 'early_schedule': plan.sparse.early_schedule,
+                'video_token_order': plan.sparse.video_token_order,
                 'step_video_budgets': (
                     None
                     if plan.sparse.step_video_budgets is None
@@ -1244,6 +1425,7 @@ def _reconcile_plan(
     phase='node',
     force_rebuild=False,
 ):
+    clear_cube_order(patched)
     blocks = get_h3_blocks(patched)
     inventory = inspect_h3_linears(blocks)
     environment = RuntimeEnvironment.detect()
@@ -1334,6 +1516,10 @@ def _reconcile_plan(
     embedding_memory_selected = (
         'release' if is_embedding_memory_installed(patched) else 'stock'
     )
+    if plan.sparse is not None:
+        cube_shape = TOKEN_ORDER_SHAPES[plan.sparse.video_token_order]
+        if cube_shape is not None:
+            install_cube_order(patched, cube_shape)
     runtime_installed = False
     if sparse_execution_selected:
         _session, _created = _ensure_sparse_runtime(patched)

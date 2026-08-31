@@ -41,7 +41,7 @@ _lse_results = {}
 
 # Bump whenever the meaning of a cached pass/fail changes without changing the
 # native binary build ID. Otherwise an old failure can survive a Python-only fix.
-_SELFTEST_REVISION = 'v7'
+_SELFTEST_REVISION = 'v9'
 
 # K > 512 is intentional. Blackwell's dense CTA_K=64 launcher chooses a
 # lower-pressure probability path at K <= 512 while sparse always uses fused
@@ -50,7 +50,7 @@ _BATCH, _HEADS, _Q_LEN, _KV_LEN, _HEAD_DIM = 1, 4, 640, 640, 128
 
 # Keep this local to the native startup layer: importing the high-level sparse
 # backend here would pull Comfy runtime modules into pre-startup initialization.
-_SPARSE_PARITY_GEOMETRIES = ((128, 128), (128, 64), (64, 64))
+_SPARSE_PARITY_GEOMETRIES = ((128, 128), (128, 64), (64, 128), (64, 64))
 _PRODUCTION_GEOMETRIES = ((64, 64), (128, 64))
 
 # Healthy INT8 error is ~0.016 relative L2; the mildest corruption injected in
@@ -60,6 +60,9 @@ _INT8_TOLERANCE = 0.15
 # drift, a localized 0.02 error, and non-finite output.
 _SPARSE_REL_L2_TOLERANCE = 0.002
 _SPARSE_MAX_ABS_TOLERANCE = 0.01
+_FUSED_Q_REL_L2_TOLERANCE = 0.01
+_FUSED_Q_SUMMARY_REL_L2_TOLERANCE = 0.01
+_FUSED_Q_SUMMARY_MAX_ABS_TOLERANCE = 0.02
 
 
 def _geometry_key(q_tile, kv_tile):
@@ -90,6 +93,149 @@ def _sparse_output_health(actual, expected):
         'finite': True,
         'rel_l2': round(relative_l2, 6),
         'max_abs': round(max_abs, 6),
+        'passed': passed,
+    }
+
+
+def _dequantize_q(q, scale):
+    rows = int(q.shape[-2])
+    scale_rows = torch.arange(rows, device=q.device)
+    scale_rows = (scale_rows // 32) * 8 + scale_rows % 8
+    selected_scale = scale.index_select(-1, scale_rows)
+    return q.float() * selected_scale.unsqueeze(-1)
+
+
+def _run_fused_q(device):
+    from . import int8_attention as native
+    from .convrot import quantize_int8_rowwise_convrot256
+    from .fused_q import fused_h3_q_from_int8
+
+    if tuple(torch.cuda.get_device_capability(device)) < (8, 0):
+        return {'available': False, 'passed': False, 'reason': 'requires_sm80'}
+
+    library = loader.load()
+    available = bool(
+        getattr(library, 'h3_int8_quantize_bf16_rowwise_convrot256', None)
+        and getattr(library, 'h3_int8_fused_q', None)
+    )
+    if not available:
+        return {'available': False, 'passed': False}
+
+    rows, heads, hidden, head_dim, kv_length = 128, 2, 256, 128, 256
+    generator = torch.Generator(device=device).manual_seed(20260830)
+    x = torch.randn(
+        rows, hidden, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    activation, activation_scale = quantize_int8_rowwise_convrot256(x)
+    weight = torch.randint(
+        -8,
+        8,
+        (heads * head_dim, hidden),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    ).to(torch.int8)
+    weight_scale = (
+        torch.rand(
+            heads * head_dim,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.01
+        + 0.005
+    )
+    norm = (
+        torch.rand(
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.5
+        + 0.75
+    ).to(torch.bfloat16)
+    freqs = torch.zeros(
+        rows, 48, 2, 2, device=device, dtype=torch.bfloat16
+    )
+    freqs[:, :, 0, 0] = 1
+    freqs[:, :, 1, 1] = 1
+    epsilon = 1e-6
+
+    fused_q, fused_scale, fused_summary = fused_h3_q_from_int8(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        norm,
+        freqs,
+        full_k_length=kv_length,
+        epsilon=epsilon,
+    )
+
+    projected = torch.matmul(activation.float(), weight.float().transpose(0, 1))
+    projected = (
+        projected
+        * activation_scale
+        * weight_scale.unsqueeze(0)
+    ).to(torch.bfloat16)
+    reference = projected.view(rows, heads, head_dim)
+    inverse_rms = torch.rsqrt(
+        reference.float().square().mean(dim=-1, keepdim=True) + epsilon
+    )
+    reference = (
+        reference.float() * inverse_rms * norm.float()
+    ).to(torch.bfloat16)
+    reference = reference.permute(1, 0, 2).unsqueeze(0).contiguous()
+    reference_summary = reference.view(1, heads, 2, 64, head_dim).float().mean(
+        dim=-2
+    ).to(torch.bfloat16)
+
+    k = torch.randn(
+        1,
+        heads,
+        kv_length,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    v = torch.randn(
+        1,
+        heads,
+        kv_length,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    carrier = native.prequantize_int8_attention(reference, k, v, cta_k=64)
+    q_rel_l2 = _relative_l2(
+        _dequantize_q(fused_q, fused_scale),
+        _dequantize_q(carrier.q, carrier.q_scale),
+    )
+    summary_rel_l2 = _relative_l2(fused_summary, reference_summary)
+    summary_max_abs = (
+        fused_summary.float() - reference_summary.float()
+    ).abs().max().item()
+    finite = bool(
+        torch.isfinite(fused_scale).all()
+        and torch.isfinite(fused_summary).all()
+        and (fused_scale > 0).all()
+    )
+    torch.cuda.synchronize(device)
+    passed = bool(
+        finite
+        and q_rel_l2 < _FUSED_Q_REL_L2_TOLERANCE
+        and summary_rel_l2 < _FUSED_Q_SUMMARY_REL_L2_TOLERANCE
+        and summary_max_abs < _FUSED_Q_SUMMARY_MAX_ABS_TOLERANCE
+    )
+    return {
+        'available': True,
+        'finite': finite,
+        'q_rel_l2': round(q_rel_l2, 6),
+        'summary_rel_l2': round(summary_rel_l2, 6),
+        'summary_max_abs': round(summary_max_abs, 6),
         'passed': passed,
     }
 
@@ -235,6 +381,14 @@ def run(device=None, *, verbose=False):
             for geometry in _PRODUCTION_GEOMETRIES
         )
         detail['production_sparse_passed'] = bool(production_sparse_ok)
+        try:
+            detail['fused_q'] = _run_fused_q(device)
+        except Exception as error:
+            detail['fused_q'] = {
+                'available': True,
+                'passed': False,
+                'error': '%s: %s' % (type(error).__name__, error),
+            }
         torch.cuda.synchronize(device)
     except Exception as error:  # noqa: BLE001 - reporting is the job
         detail['error'] = '%s: %s' % (type(error).__name__, error)
@@ -347,6 +501,15 @@ def _load_result(device=None, *, force=False):
                     key,
                     detail,
                 )
+            fused_q = detail.get('fused_q', {})
+            if fused_q.get('available') and not fused_q.get('passed'):
+                logging.debug(
+                    '%s native fused-Q self-test failed on %s; using the '
+                    'established Q projection path. Detail: %s',
+                    LOG_PREFIX,
+                    key,
+                    fused_q,
+                )
         return _result, _detail_result
 
 
@@ -365,6 +528,12 @@ def sparse_geometry_check(q_tile, kv_tile, device=None, *, force=False):
         return False
     geometry_passed = detail.get('full_route_passed', {})
     return bool(geometry_passed.get(_geometry_key(*geometry), False))
+
+
+def fused_q_check(device=None, *, force=False):
+    """Whether the optional exact fused-Q producer passed device parity."""
+    _passed, detail = _load_result(device, force=force)
+    return bool(detail.get('fused_q', {}).get('passed', False))
 
 
 def sparse_lse_check(device=None, *, force=False):
