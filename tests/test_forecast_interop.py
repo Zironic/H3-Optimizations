@@ -1,7 +1,8 @@
-"""CPU contracts for forecast consumers that bypass MiniMax H3 _forward."""
+"""CPU contracts for _forward-bypassing forecast consumers and cube ordering."""
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 
@@ -20,128 +21,248 @@ comfy.options.enable_args_parsing()
 
 import torch  # noqa: E402
 
-from comfy.ldm.minimax.model import MiniMaxH3Model  # noqa: E402
 from h3_optimizations.cube_order import (  # noqa: E402
-    FORECAST_CONSUMERS_KEY,
-    FORECAST_INTEROP_API,
-    FORECAST_REPRESENTATION_KEY,
-    FORWARD_KEY,
-    SPECTRUM_WRAPPER_KEY,
-    forecast_representation_contract,
-    install,
-    restore_forecast_target_hidden_to_raster,
+    CubeOrderState,
+    SPECTRUM_RUNTIME_KEY,
+    make_forward as make_cube_forward,
     tile_aligned_cube_major_indices,
 )
+from h3_optimizations.memory import final_layer  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
-class _FakePatcher:
-    def __init__(self, model):
-        self.model = model
-        self.object_patches = {}
-        self.model_options = {"transformer_options": {}}
+class _PassThroughFinalLayer:
+    def __init__(self):
+        self.seen_video_selector = None
 
-    def get_model_object(self, name):
-        if name in self.object_patches:
-            return self.object_patches[name]
-        if name == "diffusion_model":
-            return self.model
-        if name == FORWARD_KEY:
-            return self.model._forward
-        raise KeyError(name)
-
-    def add_object_patch(self, name, value):
-        self.object_patches[name] = value
-
-
-def _model():
-    model = MiniMaxH3Model.__new__(MiniMaxH3Model)
-    torch.nn.Module.__init__(model)
-    model.patch_size = (1, 2, 2)
-    model._forward = lambda *args, **kwargs: None
-    return model
+    def forward(
+        self,
+        x,
+        _t_emb,
+        video_seg,
+        audio_seg,
+        _sigma=None,
+        _sample_sigmas=None,
+        _shifts=None,
+    ):
+        va, vb, selector = video_seg
+        aa, ab, _audio_selector = audio_seg
+        self.seen_video_selector = selector
+        return x[va:vb].clone(), x[aa:ab].clone()
 
 
-def _activate_spectrum(patcher):
-    patcher.model_options["transformer_options"]["wrappers"] = {
-        "diffusion_model": {
-            SPECTRUM_WRAPPER_KEY: [lambda executor, *args, **kwargs: None],
-        }
-    }
+def _nontrivial_mapping(sequence_offset=37):
+    # Two complete 64-token cubes make a nontrivial tile-aligned permutation
+    # when the packed video segment begins off a router-tile boundary.
+    grid = (1, 8, 16)
+    forward, inverse = tile_aligned_cube_major_indices(
+        grid,
+        sequence_offset,
+        (1, 8, 8),
+    )
+    if tuple(forward) == tuple(range(128)):
+        raise AssertionError("test geometry unexpectedly produced raster order")
+    return grid, forward, inverse
 
 
 class ForecastInteropTests(unittest.TestCase):
-    def test_spectrum_without_contract_falls_back_to_raster(self):
-        patcher = _FakePatcher(_model())
-        _activate_spectrum(patcher)
-
-        self.assertFalse(install(patcher, (1, 8, 8)))
-        self.assertNotIn(FORWARD_KEY, patcher.object_patches)
-        self.assertNotIn(
-            FORECAST_REPRESENTATION_KEY,
-            patcher.model_options["transformer_options"],
+    def test_compact_forecast_final_layer_restores_raster_by_video_row_count(self):
+        native_video_start = 37
+        grid, forward, inverse = _nontrivial_mapping(native_video_start)
+        state = CubeOrderState((1, 8, 8))
+        state.record_cube(
+            native_video_start,
+            native_video_start + 128,
+            forward,
+            inverse,
+            grid,
         )
 
-    def test_spectrum_contract_allows_requested_cube_order(self):
-        patcher = _FakePatcher(_model())
-        _activate_spectrum(patcher)
-        patcher.model_options["transformer_options"][FORECAST_CONSUMERS_KEY] = {
-            SPECTRUM_WRAPPER_KEY: {
-                "api": FORECAST_INTEROP_API,
-                "accepts_representation_adapter": True,
-            }
-        }
-
-        self.assertTrue(install(patcher, (1, 8, 8)))
-        self.assertIn(FORWARD_KEY, patcher.object_patches)
-        contract = patcher.model_options["transformer_options"][
-            FORECAST_REPRESENTATION_KEY
-        ]
-        self.assertEqual(contract["api"], FORECAST_INTEROP_API)
-        self.assertEqual(contract["video_token_order"], (1, 8, 8))
-        self.assertTrue(callable(contract["to_native_target_hidden"]))
-
-    def test_adapter_restores_only_target_video_rows_to_native_raster(self):
-        audio_rows = 5
-        video_rows = 64
+        audio_rows = 6
         hidden = 3
-        layout = type(
-            "Layout",
-            (),
-            {"segments": [(0, audio_rows, "audio"), (audio_rows, audio_rows + video_rows, "video")]},
-        )()
-        raster_video = torch.arange(
-            video_rows * hidden,
-            dtype=torch.float32,
-        ).reshape(video_rows, hidden)
-        forward, _inverse = tile_aligned_cube_major_indices(
-            (1, 8, 8),
-            audio_rows,
-            (1, 8, 8),
-        )
         audio = torch.full((audio_rows, hidden), -7.0)
-        cube_target = torch.cat((audio, raster_video[list(forward)]), dim=0).unsqueeze(0)
+        raster_video = torch.arange(128 * hidden, dtype=torch.float32).reshape(
+            128,
+            hidden,
+        )
+        cube_video = raster_video[list(forward)]
+        compact = torch.cat((audio, cube_video), dim=0)
 
-        restored = restore_forecast_target_hidden_to_raster(
-            cube_target,
-            layout=layout,
-            video_shape=(1, 16, 16),
-            patch_size=(1, 2, 2),
-            cube_shape=(1, 8, 8),
+        layer = _PassThroughFinalLayer()
+        wrapped = final_layer.make_forward(layer, cube_state=state)
+        video, restored_audio = wrapped(
+            compact,
+            None,
+            (audio_rows, audio_rows + 128, 0),
+            (0, audio_rows, 0),
         )
 
-        self.assertTrue(torch.equal(restored[0, :audio_rows], audio))
-        self.assertTrue(torch.equal(restored[0, audio_rows:], raster_video))
-        self.assertFalse(torch.equal(restored, cube_target))
+        self.assertTrue(torch.equal(video, raster_video))
+        self.assertTrue(torch.equal(restored_audio, audio))
 
-    def test_contract_is_geometry_agnostic_across_supported_cube_shapes(self):
-        for shape in ((1, 8, 8), (1, 16, 4), (4, 4, 4)):
-            with self.subTest(shape=shape):
-                contract = forecast_representation_contract(shape)
-                self.assertEqual(contract["api"], FORECAST_INTEROP_API)
-                self.assertEqual(contract["video_token_order"], shape)
-                self.assertTrue(callable(contract["to_native_target_hidden"]))
+    def test_bypass_per_token_selector_is_forward_permuted_before_final_layer(self):
+        native_video_start = 37
+        grid, forward, inverse = _nontrivial_mapping(native_video_start)
+        state = CubeOrderState((1, 8, 8))
+        state.record_cube(
+            native_video_start,
+            native_video_start + 128,
+            forward,
+            inverse,
+            grid,
+        )
+        layer = _PassThroughFinalLayer()
+        wrapped = final_layer.make_forward(layer, cube_state=state)
+        selector = torch.arange(128, dtype=torch.long)
+        compact = torch.zeros(134, 2)
+
+        wrapped(
+            compact,
+            None,
+            (6, 134, selector),
+            (0, 6, 0),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                layer.seen_video_selector,
+                selector[list(forward)],
+            )
+        )
+
+    def test_native_cube_call_does_not_double_permute_existing_selector(self):
+        native_video_start = 37
+        grid, forward, inverse = _nontrivial_mapping(native_video_start)
+        state = CubeOrderState((1, 8, 8))
+        entry = state.record_cube(
+            native_video_start,
+            native_video_start + 128,
+            forward,
+            inverse,
+            grid,
+        )
+        layer = _PassThroughFinalLayer()
+        wrapped = final_layer.make_forward(layer, cube_state=state)
+        already_cube = torch.arange(128, dtype=torch.long)[list(forward)]
+        packed = torch.zeros(native_video_start + 128, 2)
+
+        token = state.begin_call(entry)
+        try:
+            wrapped(
+                packed,
+                None,
+                (native_video_start, native_video_start + 128, already_cube),
+                (0, 6, 0),
+            )
+        finally:
+            state.end_call(token)
+
+        self.assertTrue(torch.equal(layer.seen_video_selector, already_cube))
+
+    def test_spectrum_state_conditioned_residual_keeps_native_raster_input(self):
+        patch_size = (1, 2, 2)
+        model = SimpleNamespace(patch_size=patch_size)
+        state = CubeOrderState((1, 8, 8))
+        captured = {}
+
+        def original(
+            x,
+            _timestep,
+            _context,
+            _transformer_options,
+            minimax_payload=None,
+            **_kwargs,
+        ):
+            captured["video"] = x[0]
+            captured["layout"] = minimax_payload["layout"]
+            return [x[0].clone(), x[1]]
+
+        wrapped = make_cube_forward(
+            model,
+            original,
+            (1, 8, 8),
+            state,
+        )
+        video = torch.arange(1 * 1 * 1 * 16 * 16, dtype=torch.float32).reshape(
+            1,
+            1,
+            1,
+            16,
+            16,
+        )
+        audio = torch.zeros(1, 2, 2, 3)
+        runtime = SimpleNamespace(state_conditioned_residual=True)
+
+        output = wrapped(
+            [video, audio],
+            torch.tensor([500.0]),
+            torch.zeros(1, 3, 8),
+            {SPECTRUM_RUNTIME_KEY: runtime},
+            minimax_payload={},
+        )
+
+        self.assertIs(captured["video"], video)
+        self.assertTrue(torch.equal(output[0], video))
+        self.assertFalse(hasattr(captured["layout"], "h3_cube_order"))
+        video_segment = next(
+            segment
+            for segment in captured["layout"].segments
+            if segment[2] == "video"
+        )
+        entry = state.resolve((video_segment[0], video_segment[1], 0))
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["mode"], "raster")
+
+    def test_ordinary_spectrum_runtime_does_not_disable_cube_order(self):
+        patch_size = (1, 2, 2)
+        model = SimpleNamespace(patch_size=patch_size)
+        state = CubeOrderState((1, 8, 8))
+        captured = {}
+
+        def original(
+            x,
+            _timestep,
+            _context,
+            _transformer_options,
+            minimax_payload=None,
+            **_kwargs,
+        ):
+            captured["video"] = x[0]
+            captured["layout"] = minimax_payload["layout"]
+            return [x[0].clone(), x[1]]
+
+        wrapped = make_cube_forward(
+            model,
+            original,
+            (1, 8, 8),
+            state,
+        )
+        video = torch.arange(1 * 1 * 1 * 16 * 32, dtype=torch.float32).reshape(
+            1,
+            1,
+            1,
+            16,
+            32,
+        )
+        audio = torch.zeros(1, 2, 2, 3)
+        runtime = SimpleNamespace(state_conditioned_residual=False)
+
+        wrapped(
+            [video, audio],
+            torch.tensor([500.0]),
+            torch.zeros(1, 3, 8),
+            {SPECTRUM_RUNTIME_KEY: runtime},
+            minimax_payload={},
+        )
+
+        self.assertTrue(hasattr(captured["layout"], "h3_cube_order"))
+        self.assertFalse(
+            torch.equal(
+                captured["video"],
+                video,
+            )
+        )
 
 
 if __name__ == "__main__":
