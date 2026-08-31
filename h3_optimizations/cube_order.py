@@ -1,7 +1,8 @@
 """MiniMax H3 cube-major target-video token ordering."""
 
+from contextvars import ContextVar
 from copy import copy
-from functools import lru_cache, partial
+from functools import lru_cache
 import inspect
 import logging
 
@@ -22,6 +23,8 @@ CUBE_SHAPES = ((1, 8, 8), (1, 16, 4), (4, 4, 4))
 CUBE_SHAPE = (1, 8, 8)
 ROUTER_TILE = 64
 FORWARD_KEY = "diffusion_model._forward"
+CUBE_STATE_KEY = "h3_optimizations_cube_order_state"
+SPECTRUM_RUNTIME_KEY = "spectrum_h3_runtime"
 LOG_PREFIX = "[H3 cube order]"
 TOKEN_ORDER_SHAPES = {
     VIDEO_TOKEN_ORDER_1X8X8: (1, 8, 8),
@@ -29,21 +32,152 @@ TOKEN_ORDER_SHAPES = {
     VIDEO_TOKEN_ORDER_4X4X4: (4, 4, 4),
     VIDEO_TOKEN_ORDER_RASTER: None,
 }
-
-# A denoiser-forecast consumer such as Spectrum may bypass MiniMaxH3Model._forward
-# and feed a predicted final-block hidden state directly into H3's FinalLayer.
-# Cube ordering is an internal representation change inside _forward, so such a
-# consumer must opt in to an adapter contract before non-raster ordering is safe.
-FORECAST_INTEROP_API = 1
-FORECAST_CONSUMERS_KEY = "h3_optimizations_forecast_consumers"
-FORECAST_REPRESENTATION_KEY = "h3_optimizations_forecast_representation"
-SPECTRUM_WRAPPER_KEY = "spectrum_minimax_h3"
-FORECAST_BYPASS_WRAPPER_KEYS = frozenset({SPECTRUM_WRAPPER_KEY})
 _PACKED_LAYOUT_PARAMETERS = inspect.signature(PackedLayout).parameters
 
 
 class H3CubeOrderPatchError(RuntimeError):
     pass
+
+
+class CubeOrderState:
+    """Per-patcher row-order state shared by _forward and FinalLayer.
+
+    Native H3 calls use absolute packed-sequence offsets while forecast consumers
+    such as Spectrum call FinalLayer on compact [audio | video] target tensors.
+    Keep the exact native segment for ordinary calls and the latest matching
+    video-row topology for compact bypass calls.
+    """
+
+    def __init__(self, cube_shape=CUBE_SHAPE):
+        self.cube_shape = tuple(int(value) for value in cube_shape)
+        self._entries = {}
+        self._latest = None
+        self._index_cache = {}
+        self._active_entry = ContextVar(
+            "h3_optimizations_cube_order_active_entry",
+            default=None,
+        )
+        self._warned_state_residual = False
+
+    def clear(self):
+        self._entries.clear()
+        self._latest = None
+        self._index_cache.clear()
+        self._warned_state_residual = False
+
+    def record_cube(self, start, stop, forward, inverse, grid_shape):
+        entry = {
+            "mode": "cube",
+            "start": int(start),
+            "stop": int(stop),
+            "rows": int(stop) - int(start),
+            "forward": tuple(int(value) for value in forward),
+            "inverse": tuple(int(value) for value in inverse),
+            "grid_shape": tuple(int(value) for value in grid_shape),
+            "cube_shape": self.cube_shape,
+        }
+        self._entries[(entry["start"], entry["stop"])] = entry
+        self._latest = entry
+        return entry
+
+    def record_raster(self, start, stop, grid_shape):
+        entry = {
+            "mode": "raster",
+            "start": int(start),
+            "stop": int(stop),
+            "rows": int(stop) - int(start),
+            "forward": None,
+            "inverse": None,
+            "grid_shape": tuple(int(value) for value in grid_shape),
+            "cube_shape": None,
+        }
+        self._entries[(entry["start"], entry["stop"])] = entry
+        self._latest = entry
+        return entry
+
+    def begin_call(self, entry):
+        return self._active_entry.set(entry)
+
+    def end_call(self, token):
+        self._active_entry.reset(token)
+
+    def active_entry(self):
+        return self._active_entry.get()
+
+    def resolve(self, video_seg):
+        first, last, _row = video_seg
+        key = (int(first), int(last))
+        entry = self._entries.get(key)
+        if entry is not None:
+            return entry
+        rows = key[1] - key[0]
+        latest = self._latest
+        if latest is not None and int(latest["rows"]) == rows:
+            return latest
+        matches = [
+            candidate
+            for candidate in self._entries.values()
+            if int(candidate["rows"]) == rows
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _index(self, entry, kind, device):
+        values = entry[kind]
+        if values is None:
+            return None
+        key = (id(entry), kind, str(device))
+        index = self._index_cache.get(key)
+        if index is None or index.device != device:
+            index = torch.tensor(values, dtype=torch.long, device=device)
+            self._index_cache[key] = index
+        return index
+
+    def reorder_native_selector_for_bypass(self, selector, video_seg):
+        entry = self.resolve(video_seg)
+        if entry is None or entry["mode"] != "cube" or not torch.is_tensor(selector):
+            return selector
+        if self.active_entry() is entry:
+            # Native _forward already reordered the denoise mask, therefore its
+            # per-row timestep selector is already in cube order.
+            return selector
+        if selector.ndim == 0:
+            return selector
+        if int(selector.shape[0]) != int(entry["rows"]):
+            raise H3CubeOrderPatchError(
+                "FinalLayer video selector row count does not match cube-order topology"
+            )
+        return selector.index_select(
+            0,
+            self._index(entry, "forward", selector.device),
+        )
+
+    def restore_projected_video(self, rows, video_seg):
+        entry = self.resolve(video_seg)
+        if entry is None or entry["mode"] != "cube":
+            return rows
+        if not torch.is_tensor(rows) or rows.ndim < 2:
+            raise H3CubeOrderPatchError(
+                "FinalLayer video projection has an unexpected tensor contract"
+            )
+        if int(rows.shape[0]) != int(entry["rows"]):
+            raise H3CubeOrderPatchError(
+                "FinalLayer video projection row count does not match cube-order topology"
+            )
+        return rows.index_select(
+            0,
+            self._index(entry, "inverse", rows.device),
+        )
+
+    def warn_state_residual_fallback(self):
+        if self._warned_state_residual:
+            return
+        self._warned_state_residual = True
+        logging.warning(
+            "%s using raster target-video order because Spectrum "
+            "state_conditioned_residual mixes forecast residuals with a native "
+            "raster input embedding before FinalLayer",
+            LOG_PREFIX,
+        )
 
 
 def _cube_groups(grid_shape, cube_shape=CUBE_SHAPE):
@@ -195,19 +329,27 @@ def _layout(payload, context, padded_video, audio):
             "keyframes": payload.get("keyframes"),
             "refs": payload.get("refs"),
         }
-        # ComfyUI v0.33 requires frame_count to resolve a last-frame FL2VA
-        # anchor. v0.34 removed that constructor parameter when it generalized
-        # PackedLayout to arbitrary keyframe positions, so only forward metadata
-        # that the installed Comfy constructor actually accepts.
         if "frame_count" in _PACKED_LAYOUT_PARAMETERS:
             kwargs["frame_count"] = payload.get("frame_count")
         layout = PackedLayout(*signature, **kwargs)
     return layout
 
 
-def make_forward(model, original_forward, cube_shape=CUBE_SHAPE):
+def _spectrum_state_conditioned_residual(transformer_options):
+    runtime = (transformer_options or {}).get(SPECTRUM_RUNTIME_KEY)
+    if runtime is None:
+        return False
+    return bool(
+        getattr(runtime, "state_conditioned_residual", False)
+        or getattr(runtime, "active_state_conditioned_residual", False)
+        or getattr(runtime, "active_state_residual_mode", False)
+    )
+
+
+def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
     patch_size = tuple(int(value) for value in model.patch_size)
     cube_shape = tuple(int(value) for value in cube_shape)
+    state = CubeOrderState(cube_shape) if state is None else state
 
     def cube_order_forward(
         x,
@@ -226,18 +368,44 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE):
 
         payload = dict(minimax_payload or {})
         layout = _layout(payload, context, padded_video, audio)
-        video_start = next(
-            start for start, _stop, kind in layout.segments if kind == "video"
+        video_start, video_stop, _kind = next(
+            segment for segment in layout.segments if segment[2] == "video"
         )
+
+        if _spectrum_state_conditioned_residual(transformer_options):
+            payload["layout"] = layout
+            entry = state.record_raster(video_start, video_stop, grid_shape)
+            state.warn_state_residual_fallback()
+            token = state.begin_call(entry)
+            try:
+                return original_forward(
+                    x,
+                    timestep,
+                    context,
+                    transformer_options,
+                    minimax_payload=payload,
+                    denoise_mask=denoise_mask,
+                    audio_denoise_mask=audio_denoise_mask,
+                    **kwargs,
+                )
+            finally:
+                state.end_call(token)
+
         forward, inverse = tile_aligned_cube_major_indices(
             grid_shape, int(video_start), cube_shape
         )
         payload["layout"] = reorder_target_positions(
             layout, forward, grid_shape, cube_shape
         )
+        entry = state.record_cube(
+            video_start,
+            video_stop,
+            forward,
+            inverse,
+            grid_shape,
+        )
 
         forward_index = torch.tensor(forward, dtype=torch.long, device=video.device)
-        inverse_index = torch.tensor(inverse, dtype=torch.long, device=video.device)
         ordered_x = list(x)
         ordered_x[0] = reorder_video_patches(padded_video, forward_index, patch_size)
 
@@ -249,32 +417,39 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE):
                 patch_size,
             )
 
-        output = original_forward(
-            ordered_x,
-            timestep,
-            context,
-            transformer_options,
-            minimax_payload=payload,
-            denoise_mask=ordered_mask,
-            audio_denoise_mask=audio_denoise_mask,
-            **kwargs,
-        )
+        token = state.begin_call(entry)
+        try:
+            output = original_forward(
+                ordered_x,
+                timestep,
+                context,
+                transformer_options,
+                minimax_payload=payload,
+                denoise_mask=ordered_mask,
+                audio_denoise_mask=audio_denoise_mask,
+                **kwargs,
+            )
+        finally:
+            state.end_call(token)
         if not isinstance(output, (list, tuple)) or len(output) < 2:
             raise H3CubeOrderPatchError(
                 "MiniMax H3 _forward returned an unexpected output contract"
             )
 
-        restored = reorder_video_patches(output[0], inverse_index, patch_size)
-        restored = restored[
+        # The FinalLayer patch restores video rows to native raster order before
+        # unpatchify. This wrapper now owns only the padding crop, because it had
+        # to feed a padded pseudo-video into native _forward to express the row
+        # permutation as ordinary H3 input.
+        result = list(output)
+        result[0] = result[0][
             :, :, :original_shape[0], :original_shape[1], :original_shape[2]
         ]
-        result = list(output)
-        result[0] = restored
         return tuple(result) if isinstance(output, tuple) else result
 
     cube_order_forward._h3_cube_order = True
     cube_order_forward._h3_cube_order_shape = cube_shape
     cube_order_forward._h3_cube_order_original = original_forward
+    cube_order_forward._h3_cube_order_state = state
     return cube_order_forward
 
 
@@ -289,136 +464,24 @@ def _same_callable(left, right):
 
 
 def _transformer_options(model_patcher):
-    return getattr(model_patcher, "model_options", {}).setdefault(
+    options = getattr(model_patcher, "model_options", {})
+    options["transformer_options"] = options.get("transformer_options", {}).copy()
+    return options["transformer_options"]
+
+
+def get_state(model_patcher):
+    state = getattr(model_patcher, "model_options", {}).get(
         "transformer_options",
         {},
-    )
-
-
-def _active_wrapper_keys(model_patcher):
-    wrappers = _transformer_options(model_patcher).get("wrappers", {})
-    keys = set()
-    if not isinstance(wrappers, dict):
-        return keys
-    for keyed in wrappers.values():
-        if isinstance(keyed, dict):
-            keys.update(str(key) for key in keyed)
-    return keys
-
-
-def _forecast_consumer_supports_adapter(model_patcher, consumer_key):
-    consumers = _transformer_options(model_patcher).get(
-        FORECAST_CONSUMERS_KEY,
-        {},
-    )
-    if not isinstance(consumers, dict):
-        return False
-    declaration = consumers.get(consumer_key)
-    return bool(
-        isinstance(declaration, dict)
-        and declaration.get("api") == FORECAST_INTEROP_API
-        and declaration.get("accepts_representation_adapter") is True
-    )
-
-
-def incompatible_forecast_consumers(model_patcher):
-    """Return known _forward-bypassing consumers lacking representation interop."""
-    active = _active_wrapper_keys(model_patcher)
-    return tuple(
-        key
-        for key in sorted(FORECAST_BYPASS_WRAPPER_KEYS.intersection(active))
-        if not _forecast_consumer_supports_adapter(model_patcher, key)
-    )
-
-
-def restore_forecast_target_hidden_to_raster(
-    target_hidden,
-    *,
-    layout,
-    video_shape,
-    patch_size=(1, 2, 2),
-    cube_shape=CUBE_SHAPE,
-):
-    """Restore compact [target audio | target video] hidden rows to native raster.
-
-    Forecast consumers that bypass MiniMaxH3Model._forward can call this adapter
-    immediately before H3 FinalLayer. The consumer may keep history in the
-    transformed representation; only the output-head boundary must be native.
-    """
-    if not torch.is_tensor(target_hidden) or target_hidden.ndim < 3:
-        raise ValueError(
-            "forecast target hidden must be a tensor with [..., rows, hidden] layout"
-        )
-    video_segments = [segment for segment in layout.segments if segment[2] == "video"]
-    if not video_segments:
-        raise ValueError("MiniMax H3 packed layout has no target-video segment")
-    start, stop, _kind = video_segments[-1]
-    video_rows = int(stop) - int(start)
-    if video_rows <= 0 or int(target_hidden.shape[-2]) < video_rows:
-        raise ValueError("forecast target hidden does not contain the target-video rows")
-
-    patch_size = tuple(int(value) for value in patch_size)
-    cube_shape = tuple(int(value) for value in cube_shape)
-    spatial = tuple(int(value) for value in tuple(video_shape)[-3:])
-    if len(spatial) != 3 or len(patch_size) != 3:
-        raise ValueError("video_shape and patch_size must expose T/H/W dimensions")
-    padded = tuple(
-        ((value + patch - 1) // patch) * patch
-        for value, patch in zip(spatial, patch_size)
-    )
-    grid_shape = tuple(
-        padded[axis] // patch_size[axis]
-        for axis in range(3)
-    )
-    if grid_shape[0] * grid_shape[1] * grid_shape[2] != video_rows:
-        raise ValueError(
-            "forecast target-video row count does not match the padded patch grid"
-        )
-
-    _forward, inverse = tile_aligned_cube_major_indices(
-        grid_shape,
-        int(start),
-        cube_shape,
-    )
-    index = torch.tensor(
-        inverse,
-        dtype=torch.long,
-        device=target_hidden.device,
-    )
-    restored = target_hidden.clone()
-    video = target_hidden[..., -video_rows:, :].index_select(-2, index)
-    restored[..., -video_rows:, :].copy_(video)
-    return restored
-
-
-def forecast_representation_contract(cube_shape=CUBE_SHAPE):
-    """Return the v1 adapter contract for an active non-raster H3 representation."""
-    cube_shape = tuple(int(value) for value in cube_shape)
-    return {
-        "api": FORECAST_INTEROP_API,
-        "scope": "final_block_target_hidden",
-        "representation": "cube_major_target_video",
-        "native_representation": "raster_target_video",
-        "video_token_order": cube_shape,
-        "to_native_target_hidden": partial(
-            restore_forecast_target_hidden_to_raster,
-            cube_shape=cube_shape,
-        ),
-    }
-
-
-def _publish_forecast_representation(model_patcher, cube_shape):
-    _transformer_options(model_patcher)[FORECAST_REPRESENTATION_KEY] = (
-        forecast_representation_contract(cube_shape)
-    )
-
-
-def _clear_forecast_representation(model_patcher):
-    _transformer_options(model_patcher).pop(FORECAST_REPRESENTATION_KEY, None)
+    ).get(CUBE_STATE_KEY)
+    return state if isinstance(state, CubeOrderState) else None
 
 
 def clear(model_patcher):
-    _clear_forecast_representation(model_patcher)
+    state = get_state(model_patcher)
+    if state is not None:
+        state.clear()
+    _transformer_options(model_patcher).pop(CUBE_STATE_KEY, None)
     patches = getattr(model_patcher, "object_patches", {})
     current = patches.get(FORWARD_KEY)
     if current is None or not getattr(current, "_h3_cube_order", False):
@@ -463,32 +526,20 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
             % (tuple(model.patch_size),)
         )
 
-    incompatible = incompatible_forecast_consumers(model_patcher)
-    if incompatible:
-        _clear_forecast_representation(model_patcher)
-        logging.warning(
-            "%s using raster target-video order because forecast consumer(s) %s "
-            "bypass H3 _forward without forecast representation API v%d support",
-            LOG_PREFIX,
-            ", ".join(incompatible),
-            FORECAST_INTEROP_API,
-        )
-        return False
-
     original = model_patcher.get_model_object(FORWARD_KEY)
     if getattr(original, "_h3_cube_order", False):
         if getattr(original, "_h3_cube_order_shape", None) == cube_shape:
-            _publish_forecast_representation(model_patcher, cube_shape)
             return False
         raise H3CubeOrderPatchError("another H3 cube-order configuration is installed")
 
+    state = CubeOrderState(cube_shape)
+    _transformer_options(model_patcher)[CUBE_STATE_KEY] = state
     model_patcher.add_object_patch(
         FORWARD_KEY,
-        make_forward(model, original, cube_shape),
+        make_forward(model, original, cube_shape, state),
     )
-    _publish_forecast_representation(model_patcher, cube_shape)
     logging.debug(
-        "%s armed: cube=%s edge_tokens_only=true",
+        "%s armed: cube=%s edge_tokens_only=true restore=FinalLayer",
         LOG_PREFIX,
         cube_shape,
     )
@@ -498,23 +549,19 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
 __all__ = [
     "CUBE_SHAPE",
     "CUBE_SHAPES",
-    "FORECAST_BYPASS_WRAPPER_KEYS",
-    "FORECAST_CONSUMERS_KEY",
-    "FORECAST_INTEROP_API",
-    "FORECAST_REPRESENTATION_KEY",
+    "CUBE_STATE_KEY",
+    "CubeOrderState",
     "FORWARD_KEY",
     "H3CubeOrderPatchError",
     "ROUTER_TILE",
-    "SPECTRUM_WRAPPER_KEY",
+    "SPECTRUM_RUNTIME_KEY",
     "TOKEN_ORDER_SHAPES",
     "clear",
     "cube_major_indices",
-    "forecast_representation_contract",
-    "incompatible_forecast_consumers",
+    "get_state",
     "install",
     "make_forward",
     "reorder_target_positions",
     "reorder_video_patches",
-    "restore_forecast_target_hidden_to_raster",
     "tile_aligned_cube_major_indices",
 ]
