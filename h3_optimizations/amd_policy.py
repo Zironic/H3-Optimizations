@@ -9,7 +9,6 @@ import torch
 
 from . import apply as _base
 from . import apply_policy as _policy  # noqa: F401 - installs ordinary policy first
-from .attention.sparse import existing_dense_sparse as _dense_sparse
 from .attention.sparse.existing_dense_sparse import (
     ExistingDenseSparseBackend,
     ExistingDenseSparseError,
@@ -25,6 +24,9 @@ from .plan import (
     QKV_STREAMING_FORCED,
     QKV_STREAMING_OFF,
     SPARSE_BACKEND_AUTO,
+    SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_SAGE,
+    SPARSE_BACKEND_TRITON,
 )
 from .qkv import policy as _qkv_policy
 from .qkv.providers import (
@@ -43,9 +45,7 @@ RDNA2_ARCHES = frozenset(
 SELECTED_EXISTING_DENSE_SPARSE = 'rocm_existing_dense_sparse'
 
 _POLICY_RESOLVE_ATTENTION = _base._resolve_attention
-_ORIGINAL_TRITON_PREFLIGHT = _base.preflight_triton_sparse
-_ORIGINAL_PACKED_EXECUTE = _dense_sparse._execute_packed_sparse
-_packed_runtime_fallback_warned = False
+_ORIGINAL_RESOLVE_TRITON_SPARSE = _base._resolve_triton_sparse
 
 
 def _active_rocm_architecture(environment=None):
@@ -72,64 +72,27 @@ def _is_rdna2(environment):
     )
 
 
-def preflight_triton_sparse(*args, **kwargs):
-    '''Do not compile the already-known-broken BF16 Triton path on gfx103x.'''
-    architecture = _active_rocm_architecture()
+def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
+    '''Reject the known-impossible RDNA2 BF16 Triton path before preflight.'''
+    architecture = _active_rocm_architecture(environment)
     if architecture in RDNA2_ARCHES:
         raise _base.TritonSparseError(
-            'RDNA2 BF16 Triton is disabled after gfx103x rejected BF16 dot '
-            'lowering; Auto will try the existing-dense sparse adapter'
+            'BF16 Triton sparse attention is unavailable on RDNA2 %s because '
+            'gfx103x does not provide the BF16 matrix multiply required by this '
+            'backend' % architecture
         )
-    return _ORIGINAL_TRITON_PREFLIGHT(*args, **kwargs)
+    return _ORIGINAL_RESOLVE_TRITON_SPARSE(
+        plan,
+        environment,
+        inventory,
+        fallback_reason,
+    )
 
 
-# The ordinary resolver looks this global up when it reaches Triton.  Replacing
-# it here skips the compile-failing RDNA2 probe while leaving every other device
-# on the original implementation.
-_base.preflight_triton_sparse = preflight_triton_sparse
-
-
-def _safe_execute_packed_sparse(
-    q,
-    k,
-    v,
-    selected_tiles,
-    transformer_options,
-    *,
-    spec,
-):
-    '''Fail an unanticipated packed-shape rejection open to full dense attention.'''
-    global _packed_runtime_fallback_warned
-    try:
-        return _ORIGINAL_PACKED_EXECUTE(
-            q,
-            k,
-            v,
-            selected_tiles,
-            transformer_options,
-            spec=spec,
-        )
-    except Exception as error:
-        if not _packed_runtime_fallback_warned:
-            _packed_runtime_fallback_warned = True
-            logging.warning(
-                '%s RDNA2 packed sparse call failed at runtime; using full '
-                'existing dense attention for the affected Q slab: %s: %s',
-                LOG_PREFIX,
-                type(error).__name__,
-                error,
-            )
-        return _dense_sparse._call_existing_dense(
-            q,
-            k,
-            v,
-            transformer_options,
-            heads=int(q.shape[1]),
-        )
-
-
-_safe_execute_packed_sparse._h3_rdna2_dense_fallback = True
-_dense_sparse._execute_packed_sparse = _safe_execute_packed_sparse
+# apply.py resolves this global at execution time, including calls made through
+# apply_policy's saved base resolver. Explicit BF16 Triton therefore gets the
+# same selected-device-aware RDNA2 rejection as automatic resolution.
+_base._resolve_triton_sparse = _resolve_triton_sparse
 
 
 def _common_streamable(inventory):
@@ -225,22 +188,36 @@ def _fallback_device(environment):
     return torch.device('cuda' if index is None else 'cuda:%d' % int(index))
 
 
-def resolve_attention(plan, model, inventory, environment):
-    '''Substitute sparse-over-dense only for RDNA2 Auto that otherwise went dense.'''
-    attention, qkv = _POLICY_RESOLVE_ATTENTION(
-        plan,
-        model,
-        inventory,
-        environment,
-    )
+def _preserves_external_override(plan, model):
     sparse = getattr(plan, 'sparse', None)
-    if (
-        sparse is None
-        or sparse.backend != SPARSE_BACKEND_AUTO
-        or not _is_rdna2(environment)
-        or attention.selected != _base.ATTENTION_EXISTING
-    ):
-        return attention, qkv
+    if sparse is None:
+        return False
+    options = getattr(model, 'model_options', {}).get('transformer_options', {}) or {}
+    override = options.get('optimized_attention_override')
+    return bool(
+        override is not None
+        and not _base.is_installed_dense_attention(options)
+        and not _base.is_comfy_kitchen_dense_attention(options)
+    )
+
+
+def _resolve_existing_dense_adapter(
+    plan,
+    model,
+    inventory,
+    environment,
+    attention,
+    qkv,
+    fallback_reason,
+):
+    if attention.selected != _base.ATTENTION_EXISTING:
+        return (
+            replace(
+                attention,
+                reason='%s; %s' % (fallback_reason, attention.reason),
+            ),
+            qkv,
+        )
 
     transformer_options = (
         getattr(model, 'model_options', {}).get('transformer_options', {}) or {}
@@ -258,8 +235,9 @@ def resolve_attention(plan, model, inventory, environment):
         backend = ExistingDenseSparseBackend(config, spec=spec)
         reason = (
             '%s; RDNA2 fallback uses the existing ComfyUI dense attention '
-            'consumer over packed %dQ x %dKV routes'
-            % (attention.reason, spec.q_tile, spec.kv_tile)
+            'consumer over packed %dQ x %dKV routes; runtime adapter failures '
+            'fail open to that same full dense consumer'
+            % (fallback_reason, spec.q_tile, spec.kv_tile)
         )
         resolved = _base.ResolvedAttention(
             requested=attention.requested,
@@ -284,12 +262,94 @@ def resolve_attention(plan, model, inventory, environment):
             replace(
                 attention,
                 reason=(
-                    '%s; RDNA2 existing-dense sparse unavailable: %s: %s'
-                    % (attention.reason, type(error).__name__, error)
+                    '%s; RDNA2 existing-dense sparse unavailable: %s: %s; %s'
+                    % (
+                        fallback_reason,
+                        type(error).__name__,
+                        error,
+                        attention.reason,
+                    )
                 ),
             ),
             qkv,
         )
+
+
+def resolve_attention(plan, model, inventory, environment):
+    '''Use only potentially viable sparse paths for RDNA2 selection.'''
+    sparse = getattr(plan, 'sparse', None)
+    rdna2 = _is_rdna2(environment)
+    if sparse is not None and rdna2:
+        architecture = _active_rocm_architecture(environment) or 'gfx103x'
+        if sparse.backend == SPARSE_BACKEND_KITCHEN:
+            raise _base.SparseKitchenError(
+                'Kitchen INT8 sparse attention is unavailable on RDNA2 %s; '
+                'the experimental AMD native library targets gfx11/gfx12'
+                % architecture
+            )
+        if sparse.backend == SPARSE_BACKEND_SAGE:
+            raise _base.SparseSageError(
+                'Sparse Sage is unavailable on RDNA2 %s because its packaged '
+                'kernels are NVIDIA CUDA extensions' % architecture
+            )
+        if sparse.backend == SPARSE_BACKEND_TRITON:
+            raise _base.TritonSparseError(
+                'BF16 Triton sparse attention is unavailable on RDNA2 %s because '
+                'gfx103x does not provide the BF16 matrix multiply required by '
+                'this backend' % architecture
+            )
+
+    if (
+        sparse is None
+        or sparse.backend != SPARSE_BACKEND_AUTO
+        or not rdna2
+        or _preserves_external_override(plan, model)
+    ):
+        return _POLICY_RESOLVE_ATTENTION(
+            plan,
+            model,
+            inventory,
+            environment,
+        )
+
+    # gfx103x has no compatible native Kitchen kernel, Sparse Sage is an NVIDIA
+    # extension, and this BF16 Triton path requires BF16 matrix multiply that
+    # RDNA2 does not provide. Do not spend startup time probing known-dead paths.
+    dense_attention, dense_qkv = _base._resolve_dense(
+        plan,
+        model,
+        inventory,
+        environment,
+    )
+    skipped = (
+        'RDNA2 gfx103x skips Kitchen INT8, Sparse Sage, and BF16 Triton because '
+        'those sparse backends require hardware/runtime support unavailable on '
+        'RDNA2'
+    )
+
+    try:
+        return _base._resolve_fp8_flex(
+            plan,
+            environment,
+            inventory,
+            skipped,
+            dense_attention,
+        )
+    except _base.FP8FlexError as flex_error:
+        fallback_reason = '%s; FP8 FlexAttention unavailable: %s' % (
+            skipped,
+            flex_error,
+        )
+
+    return _resolve_existing_dense_adapter(
+        plan,
+        model,
+        inventory,
+        environment,
+        dense_attention,
+        dense_qkv,
+        fallback_reason,
+    )
 
 
 resolve_attention._h3_amd_rdna2_policy = True
@@ -299,6 +359,5 @@ _base._resolve_attention = resolve_attention
 __all__ = [
     'RDNA2_ARCHES',
     'SELECTED_EXISTING_DENSE_SPARSE',
-    'preflight_triton_sparse',
     'resolve_attention',
 ]

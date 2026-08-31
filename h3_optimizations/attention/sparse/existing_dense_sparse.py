@@ -1,11 +1,17 @@
 '''Sparse H3 routing executed through ComfyUI's existing dense attention.
 
 This backend deliberately knows nothing about the physical AMD attention kernel.
-It owns only routing and bounded K/V packing.  Each packed sparse problem is
+It owns only routing and bounded K/V packing. Each packed sparse problem is
 handed back to the same Comfy attention entry point that already runs dense H3
-on the device.  gfx103x policy probes 64Q x 64KV first and falls back to
+on the device. gfx103x policy probes 64Q x 64KV first and falls back to
 128Q x 128KV when the selected dense consumer rejects the smaller logical
 problem.
+
+The adapter is fail-open by design. A probe proves only a small shape matrix;
+an otherwise-compatible dense consumer can still reject a route, packed batch,
+or runtime shape that the probe did not exercise. Sparse adapter failures are
+therefore retried through the original full dense consumer for the affected
+scope rather than failing the H3 generation.
 '''
 
 from __future__ import annotations
@@ -39,6 +45,8 @@ _PROBE_REL_L2 = 0.03
 _PROBE_MAX_ABS = 0.10
 _probe_lock = threading.Lock()
 _probe_results = {}
+_runtime_fallback_lock = threading.Lock()
+_runtime_fallback_warned = False
 
 
 class ExistingDenseSparseError(RuntimeError):
@@ -66,20 +74,22 @@ class PreparedExistingDenseSparse:
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    lut: torch.Tensor
-    valid: torch.Tensor
+    lut: torch.Tensor | None
+    valid: torch.Tensor | None
     metadata: dict
     transformer_options: dict
+    fallback_reason: str | None = None
 
 
 @dataclass
 class PreparedStreamedExistingDenseSparse:
     projected: object
-    route_plan: object
+    route_plan: object | None
     dense_q_tiles: int
     sparse_q_tiles: int
     metadata: dict
     transformer_options: dict
+    fallback_reason: str | None = None
 
     def release(self):
         if self.projected is not None:
@@ -94,7 +104,7 @@ class ExistingDenseSparseQKVProjector(TritonSparseQKVProjector):
     '''Reuse the existing streamed-BF16 carrier without requiring Triton.'''
 
     # This name intentionally matches the already documented retained-K/V
-    # lifetime in the status formatter.  The projected object itself is the
+    # lifetime in the status formatter. The projected object itself is the
     # generic streamed BF16 carrier that Triton also consumes; projection does
     # not import or launch Triton.
     name = 'streamed_dense_bf16_qkv'
@@ -128,6 +138,26 @@ def _reference_attention(q, k, v):
     scale = q.shape[-1] ** -0.5
     scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
     return torch.matmul(scores.softmax(dim=-1), v.float()).to(q.dtype)
+
+
+def _warn_runtime_fallback(scope, error):
+    global _runtime_fallback_warned
+    with _runtime_fallback_lock:
+        if _runtime_fallback_warned:
+            return
+        _runtime_fallback_warned = True
+    logging.warning(
+        '%s RDNA2 existing-dense sparse adapter failed during %s; using full '
+        'existing dense attention for the affected scope: %s: %s',
+        LOG_PREFIX,
+        scope,
+        type(error).__name__,
+        error,
+    )
+
+
+def _fallback_reason(scope, error):
+    return '%s: %s: %s' % (scope, type(error).__name__, error)
 
 
 def _probe_case(device, transformer_options, *, q_rows, k_rows, batch):
@@ -181,7 +211,7 @@ def _probe_case(device, transformer_options, *, q_rows, k_rows, batch):
 
 
 def _probe_geometry(device, transformer_options, q_tile, kv_tile):
-    # First establish the logical shape independently of batching.  The ragged
+    # First establish the logical shape independently of batching. The ragged
     # rectangular case mirrors a selected route that includes the final partial
     # KV tile.
     for k_rows in (kv_tile, kv_tile * 2, kv_tile * 2 - 7):
@@ -193,7 +223,7 @@ def _probe_geometry(device, transformer_options, q_tile, kv_tile):
             batch=1,
         )
 
-    # Batching is an optimization only.  If an aggressive dense consumer has a
+    # Batching is an optimization only. If an aggressive dense consumer has a
     # batch restriction, retain correctness and use smaller packed groups.
     for batch in (16, 8, 4, 2):
         try:
@@ -444,6 +474,16 @@ def _project_hnd_rows(module, destination, hnd, start):
     del flat
 
 
+def _dense_attention(q, k, v, transformer_options):
+    return _call_existing_dense(
+        q,
+        k,
+        v,
+        transformer_options,
+        heads=int(q.shape[1]),
+    )
+
+
 class ExistingDenseSparseBackend:
     name = 'rocm_existing_dense_sparse'
     requires_runtime_context = True
@@ -484,94 +524,130 @@ class ExistingDenseSparseBackend:
         return snapshot
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
-        _validate_qkv(q, k, v)
-        snapshot = self._snapshot(transformer_options, q.shape[-2])
-        budget = resolve_video_budget(
-            self.config,
-            snapshot.step_index,
-            snapshot.total_steps,
-            layer_index,
-        )
+        options = transformer_options or {}
         try:
-            lut, valid, metadata = self.router.build_lut(
-                q,
-                k,
-                snapshot.layout,
-                budget,
+            _validate_qkv(q, k, v)
+            snapshot = self._snapshot(options, q.shape[-2])
+            budget = resolve_video_budget(
+                self.config,
+                snapshot.step_index,
+                snapshot.total_steps,
+                layer_index,
             )
-        except SparseRouterError as error:
-            raise ExistingDenseSparseError(
-                'existing-dense sparse routing failed: %s' % error
-            ) from error
-        details = metadata.as_dict()
-        details.update(
-            {
-                'layer': int(layer_index),
-                'sparse_backend': self.name,
-                'route_format': 'delta_int32_then_packed_dense',
-                'logical_geometry': '%dQx%dKV'
-                % (self.spec.q_tile, self.spec.kv_tile),
-            }
-        )
-        return PreparedExistingDenseSparse(
-            q=q,
-            k=k,
-            v=v,
-            lut=lut,
-            valid=valid,
-            metadata=details,
-            transformer_options=transformer_options,
-        )
+            try:
+                lut, valid, metadata = self.router.build_lut(
+                    q,
+                    k,
+                    snapshot.layout,
+                    budget,
+                )
+            except SparseRouterError as error:
+                raise ExistingDenseSparseError(
+                    'existing-dense sparse routing failed: %s' % error
+                ) from error
+            details = metadata.as_dict()
+            details.update(
+                {
+                    'layer': int(layer_index),
+                    'sparse_backend': self.name,
+                    'route_format': 'delta_int32_then_packed_dense',
+                    'logical_geometry': '%dQx%dKV'
+                    % (self.spec.q_tile, self.spec.kv_tile),
+                }
+            )
+            return PreparedExistingDenseSparse(
+                q=q,
+                k=k,
+                v=v,
+                lut=lut,
+                valid=valid,
+                metadata=details,
+                transformer_options=options,
+            )
+        except Exception as error:
+            # q/k/v are deliberately retained so execution can retry the exact
+            # invocation through the dense consumer that was already selected.
+            return PreparedExistingDenseSparse(
+                q=q,
+                k=k,
+                v=v,
+                lut=None,
+                valid=None,
+                metadata={
+                    'layer': int(layer_index),
+                    'sparse_backend': self.name,
+                    'fallback': 'existing_dense',
+                },
+                transformer_options=options,
+                fallback_reason=_fallback_reason('sparse preparation', error),
+            )
 
     def execute(self, prepared):
         if not isinstance(prepared, PreparedExistingDenseSparse):
             raise ExistingDenseSparseError('invalid existing-dense sparse payload')
         q, k, v = prepared.q, prepared.k, prepared.v
-        sequence = int(q.shape[-2])
-        heads = int(q.shape[1])
-        dense_q_tiles = int(prepared.metadata['dense_q_tiles'])
-        sparse_q_tiles = int(prepared.metadata['sparse_q_tiles'])
-        if not sparse_q_tiles:
-            return _call_existing_dense(
-                q,
-                k,
-                v,
-                prepared.transformer_options,
-                heads=heads,
-            )
+        if prepared.fallback_reason is not None:
+            error = ExistingDenseSparseError(prepared.fallback_reason)
+            _warn_runtime_fallback('sparse preparation', error)
+            return _dense_attention(q, k, v, prepared.transformer_options)
 
-        output = torch.empty_like(q)
-        dense_rows = min(sequence, dense_q_tiles * int(self.spec.q_tile))
-        if dense_rows:
-            with diagnostics.stage('sparse_attention_kernel'):
-                output[..., :dense_rows, :].copy_(
-                    _call_existing_dense(
-                        q[..., :dense_rows, :],
-                        k,
-                        v,
-                        prepared.transformer_options,
-                        heads=heads,
-                    )
+        try:
+            sequence = int(q.shape[-2])
+            heads = int(q.shape[1])
+            dense_q_tiles = int(prepared.metadata['dense_q_tiles'])
+            sparse_q_tiles = int(prepared.metadata['sparse_q_tiles'])
+            if not sparse_q_tiles:
+                return _call_existing_dense(
+                    q,
+                    k,
+                    v,
+                    prepared.transformer_options,
+                    heads=heads,
                 )
 
-        context_tiles = int(prepared.metadata['kv_tiles']) - int(
-            prepared.metadata['pure_video_kv_tiles']
-        )
-        selected_count = context_tiles + int(
-            prepared.metadata['retained_video_kv_tiles']
-        )
-        sparse_lut = prepared.lut[..., dense_q_tiles:, :selected_count]
-        absolute = torch.cumsum(sparse_lut, dim=-1, dtype=torch.int32).contiguous()
-        sparse_output = _execute_packed_sparse(
-            q[..., dense_rows:, :],
-            k,
-            v,
-            absolute,
-            prepared.transformer_options,
-            spec=self.spec,
-        )
-        output[..., dense_rows:, :].copy_(sparse_output)
-        return output
+            output = torch.empty_like(q)
+            dense_rows = min(sequence, dense_q_tiles * int(self.spec.q_tile))
+            if dense_rows:
+                with diagnostics.stage('sparse_attention_kernel'):
+                    output[..., :dense_rows, :].copy_(
+                        _call_existing_dense(
+                            q[..., :dense_rows, :],
+                            k,
+                            v,
+                            prepared.transformer_options,
+                            heads=heads,
+                        )
+                    )
+
+            context_tiles = int(prepared.metadata['kv_tiles']) - int(
+                prepared.metadata['pure_video_kv_tiles']
+            )
+            selected_count = context_tiles + int(
+                prepared.metadata['retained_video_kv_tiles']
+            )
+            sparse_lut = prepared.lut[..., dense_q_tiles:, :selected_count]
+            absolute = torch.cumsum(
+                sparse_lut,
+                dim=-1,
+                dtype=torch.int32,
+            ).contiguous()
+            sparse_output = _execute_packed_sparse(
+                q[..., dense_rows:, :],
+                k,
+                v,
+                absolute,
+                prepared.transformer_options,
+                spec=self.spec,
+            )
+            output[..., dense_rows:, :].copy_(sparse_output)
+            return output
+        except Exception as error:
+            # This catches assumptions the probe cannot prove: route generation,
+            # packed shape/batch behavior, and runtime rejection by the existing
+            # Comfy attention implementation. Discard any partially-written
+            # sparse result and recompute the whole attention invocation densely.
+            _warn_runtime_fallback('sparse execution', error)
+            return _dense_attention(q, k, v, prepared.transformer_options)
 
     def prepare_projected(
         self,
@@ -586,52 +662,99 @@ class ExistingDenseSparseBackend:
             raise ExistingDenseSparseError(
                 'existing-dense sparse attention expected streamed BF16 QKV'
             )
-        if int(projected.chunk_rows) % int(self.spec.q_tile):
-            projected.release()
-            raise ExistingDenseSparseError(
-                'streamed Q chunk size must be divisible by the selected Q tile'
-            )
-        snapshot = self._snapshot(transformer_options, projected.sequence)
-        budget = resolve_video_budget(
-            self.config,
-            snapshot.step_index,
-            snapshot.total_steps,
-            layer_index,
-        )
+        options = transformer_options or {}
+        route_plan = None
         try:
-            k_summary = self.router._mean_pool(projected.k, self.spec.kv_tile)
-            route_plan = prepare_compact_absolute_route_chunks(
-                self.router,
-                k_summary,
-                snapshot.layout,
-                budget,
+            if int(projected.chunk_rows) % int(self.spec.q_tile):
+                raise ExistingDenseSparseError(
+                    'streamed Q chunk size must be divisible by the selected Q tile'
+                )
+            snapshot = self._snapshot(options, projected.sequence)
+            budget = resolve_video_budget(
+                self.config,
+                snapshot.step_index,
+                snapshot.total_steps,
+                layer_index,
             )
-        except (SparseRouterError, TritonRouteError, Exception) as error:
-            projected.release()
-            raise ExistingDenseSparseError(
-                'streamed existing-dense sparse route preparation failed: %s'
-                % error
-            ) from error
-        projected.k_summary = None
-        metadata = route_plan.metadata.as_dict()
-        metadata.update(
-            {
-                'layer': int(layer_index),
-                'sparse_backend': self.name,
-                'logical_geometry': '%dQx%dKV'
-                % (self.spec.q_tile, self.spec.kv_tile),
-                'qkv_lifetime': 'streamed_q_global_bf16_kv',
-                'packed_dense_batch_max': int(self.spec.max_batch_entries),
-            }
-        )
-        return PreparedStreamedExistingDenseSparse(
-            projected=projected,
-            route_plan=route_plan,
-            dense_q_tiles=int(route_plan.metadata.dense_q_tiles),
-            sparse_q_tiles=int(route_plan.metadata.sparse_q_tiles),
-            metadata=metadata,
-            transformer_options=transformer_options,
-        )
+            try:
+                k_summary = self.router._mean_pool(projected.k, self.spec.kv_tile)
+                route_plan = prepare_compact_absolute_route_chunks(
+                    self.router,
+                    k_summary,
+                    snapshot.layout,
+                    budget,
+                )
+            except (SparseRouterError, TritonRouteError) as error:
+                raise ExistingDenseSparseError(
+                    'streamed existing-dense sparse route preparation failed: %s'
+                    % error
+                ) from error
+            projected.k_summary = None
+            metadata = route_plan.metadata.as_dict()
+            metadata.update(
+                {
+                    'layer': int(layer_index),
+                    'sparse_backend': self.name,
+                    'logical_geometry': '%dQx%dKV'
+                    % (self.spec.q_tile, self.spec.kv_tile),
+                    'qkv_lifetime': 'streamed_q_global_bf16_kv',
+                    'packed_dense_batch_max': int(self.spec.max_batch_entries),
+                }
+            )
+            return PreparedStreamedExistingDenseSparse(
+                projected=projected,
+                route_plan=route_plan,
+                dense_q_tiles=int(route_plan.metadata.dense_q_tiles),
+                sparse_q_tiles=int(route_plan.metadata.sparse_q_tiles),
+                metadata=metadata,
+                transformer_options=options,
+            )
+        except Exception as error:
+            if route_plan is not None:
+                route_plan.release()
+            projected.k_summary = None
+            # Keep the projected carrier alive. It still contains global K/V
+            # and can project Q slabs, which is everything needed to consume the
+            # remainder through the already-selected dense attention backend.
+            return PreparedStreamedExistingDenseSparse(
+                projected=projected,
+                route_plan=None,
+                dense_q_tiles=0,
+                sparse_q_tiles=0,
+                metadata={
+                    'layer': int(layer_index),
+                    'sparse_backend': self.name,
+                    'fallback': 'existing_dense',
+                    'qkv_lifetime': 'streamed_q_global_bf16_kv',
+                },
+                transformer_options=options,
+                fallback_reason=_fallback_reason(
+                    'streamed sparse preparation',
+                    error,
+                ),
+            )
+
+    def _project_dense_streamed_chunk(
+        self,
+        module,
+        result,
+        q,
+        projected,
+        prepared,
+        *,
+        start,
+        heads,
+    ):
+        with diagnostics.stage('sparse_attention_kernel'):
+            dense_out = _call_existing_dense(
+                q,
+                projected.k,
+                projected.v,
+                prepared.transformer_options,
+                heads=heads,
+            )
+        _project_hnd_rows(module, result, dense_out, start)
+        del dense_out
 
     def execute_projected(self, module, prepared):
         if not isinstance(prepared, PreparedStreamedExistingDenseSparse):
@@ -648,59 +771,93 @@ class ExistingDenseSparseBackend:
         heads = int(projected.heads)
         q_tile = int(self.spec.q_tile)
         try:
+            if prepared.fallback_reason is not None:
+                _warn_runtime_fallback(
+                    'streamed sparse preparation',
+                    ExistingDenseSparseError(prepared.fallback_reason),
+                )
+
             for start in range(0, sequence, int(projected.chunk_rows)):
                 end = min(start + int(projected.chunk_rows), sequence)
                 q = projected.project_q(start, end)
-                q_summary = self.router._mean_pool(q, q_tile)
-                try:
-                    selected = build_compact_absolute_route_chunk(
-                        self.router,
-                        q_summary,
-                        prepared.route_plan,
-                        q_tile_start=start // q_tile,
-                    )
-                except TritonRouteError as error:
-                    raise ExistingDenseSparseError(
-                        'streamed existing-dense sparse Q routing failed: %s'
-                        % error
-                    ) from error
-                del q_summary
 
-                dense_end = min(
-                    end,
-                    prepared.dense_q_tiles * q_tile,
-                )
-                dense_rows = max(0, dense_end - start)
-                if dense_rows:
-                    with diagnostics.stage('sparse_attention_kernel'):
-                        dense_out = _call_existing_dense(
-                            q[..., :dense_rows, :],
-                            projected.k,
-                            projected.v,
-                            prepared.transformer_options,
-                            heads=heads,
-                        )
-                    _project_hnd_rows(module, result, dense_out, start)
-                    del dense_out
-
-                sparse_rows = (end - start) - dense_rows
-                if sparse_rows:
-                    sparse_q = q[..., dense_rows:, :]
-                    sparse_out = _execute_packed_sparse(
-                        sparse_q,
-                        projected.k,
-                        projected.v,
-                        selected,
-                        prepared.transformer_options,
-                        spec=self.spec,
-                    )
-                    _project_hnd_rows(
+                if prepared.fallback_reason is not None:
+                    self._project_dense_streamed_chunk(
                         module,
                         result,
-                        sparse_out,
-                        start + dense_rows,
+                        q,
+                        projected,
+                        prepared,
+                        start=start,
+                        heads=heads,
                     )
-                    del sparse_q, sparse_out
+                else:
+                    try:
+                        q_summary = self.router._mean_pool(q, q_tile)
+                        try:
+                            selected = build_compact_absolute_route_chunk(
+                                self.router,
+                                q_summary,
+                                prepared.route_plan,
+                                q_tile_start=start // q_tile,
+                            )
+                        except TritonRouteError as error:
+                            raise ExistingDenseSparseError(
+                                'streamed existing-dense sparse Q routing failed: %s'
+                                % error
+                            ) from error
+                        del q_summary
+
+                        dense_end = min(
+                            end,
+                            prepared.dense_q_tiles * q_tile,
+                        )
+                        dense_rows = max(0, dense_end - start)
+                        if dense_rows:
+                            with diagnostics.stage('sparse_attention_kernel'):
+                                dense_out = _call_existing_dense(
+                                    q[..., :dense_rows, :],
+                                    projected.k,
+                                    projected.v,
+                                    prepared.transformer_options,
+                                    heads=heads,
+                                )
+                            _project_hnd_rows(module, result, dense_out, start)
+                            del dense_out
+
+                        sparse_rows = (end - start) - dense_rows
+                        if sparse_rows:
+                            sparse_q = q[..., dense_rows:, :]
+                            sparse_out = _execute_packed_sparse(
+                                sparse_q,
+                                projected.k,
+                                projected.v,
+                                selected,
+                                prepared.transformer_options,
+                                spec=self.spec,
+                            )
+                            _project_hnd_rows(
+                                module,
+                                result,
+                                sparse_out,
+                                start + dense_rows,
+                            )
+                            del sparse_q, sparse_out
+                        del selected
+                    except Exception as error:
+                        # The output buffer may contain a successful dense prefix
+                        # or partial sparse work. Re-running the whole Q chunk
+                        # densely overwrites that scope and restores correctness.
+                        _warn_runtime_fallback('streamed sparse execution', error)
+                        self._project_dense_streamed_chunk(
+                            module,
+                            result,
+                            q,
+                            projected,
+                            prepared,
+                            start=start,
+                            heads=heads,
+                        )
 
                 if end == sequence:
                     projected.release_weight()
@@ -709,7 +866,7 @@ class ExistingDenseSparseBackend:
                         prepared.route_plan = None
                     projected.k = None
                     projected.v = None
-                del q, selected
+                del q
             return result
         finally:
             prepared.release()
@@ -725,6 +882,7 @@ class ExistingDenseSparseBackend:
             % (self.spec.q_tile, self.spec.kv_tile),
             'dense_consumer': 'existing ComfyUI attention',
             'packed_batch_max': int(self.spec.max_batch_entries),
+            'runtime_fail_open': True,
             'approximate': True,
         }
 
