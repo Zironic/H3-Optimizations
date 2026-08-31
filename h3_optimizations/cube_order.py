@@ -1,7 +1,7 @@
 """MiniMax H3 cube-major target-video token ordering."""
 
 from copy import copy
-from functools import lru_cache
+from functools import lru_cache, partial
 import inspect
 import logging
 
@@ -29,6 +29,16 @@ TOKEN_ORDER_SHAPES = {
     VIDEO_TOKEN_ORDER_4X4X4: (4, 4, 4),
     VIDEO_TOKEN_ORDER_RASTER: None,
 }
+
+# A denoiser-forecast consumer such as Spectrum may bypass MiniMaxH3Model._forward
+# and feed a predicted final-block hidden state directly into H3's FinalLayer.
+# Cube ordering is an internal representation change inside _forward, so such a
+# consumer must opt in to an adapter contract before non-raster ordering is safe.
+FORECAST_INTEROP_API = 1
+FORECAST_CONSUMERS_KEY = "h3_optimizations_forecast_consumers"
+FORECAST_REPRESENTATION_KEY = "h3_optimizations_forecast_representation"
+SPECTRUM_WRAPPER_KEY = "spectrum_minimax_h3"
+FORECAST_BYPASS_WRAPPER_KEYS = frozenset({SPECTRUM_WRAPPER_KEY})
 _PACKED_LAYOUT_PARAMETERS = inspect.signature(PackedLayout).parameters
 
 
@@ -278,7 +288,137 @@ def _same_callable(left, right):
     )
 
 
+def _transformer_options(model_patcher):
+    return getattr(model_patcher, "model_options", {}).setdefault(
+        "transformer_options",
+        {},
+    )
+
+
+def _active_wrapper_keys(model_patcher):
+    wrappers = _transformer_options(model_patcher).get("wrappers", {})
+    keys = set()
+    if not isinstance(wrappers, dict):
+        return keys
+    for keyed in wrappers.values():
+        if isinstance(keyed, dict):
+            keys.update(str(key) for key in keyed)
+    return keys
+
+
+def _forecast_consumer_supports_adapter(model_patcher, consumer_key):
+    consumers = _transformer_options(model_patcher).get(
+        FORECAST_CONSUMERS_KEY,
+        {},
+    )
+    if not isinstance(consumers, dict):
+        return False
+    declaration = consumers.get(consumer_key)
+    return bool(
+        isinstance(declaration, dict)
+        and declaration.get("api") == FORECAST_INTEROP_API
+        and declaration.get("accepts_representation_adapter") is True
+    )
+
+
+def incompatible_forecast_consumers(model_patcher):
+    """Return known _forward-bypassing consumers lacking representation interop."""
+    active = _active_wrapper_keys(model_patcher)
+    return tuple(
+        key
+        for key in sorted(FORECAST_BYPASS_WRAPPER_KEYS.intersection(active))
+        if not _forecast_consumer_supports_adapter(model_patcher, key)
+    )
+
+
+def restore_forecast_target_hidden_to_raster(
+    target_hidden,
+    *,
+    layout,
+    video_shape,
+    patch_size=(1, 2, 2),
+    cube_shape=CUBE_SHAPE,
+):
+    """Restore compact [target audio | target video] hidden rows to native raster.
+
+    Forecast consumers that bypass MiniMaxH3Model._forward can call this adapter
+    immediately before H3 FinalLayer. The consumer may keep history in the
+    transformed representation; only the output-head boundary must be native.
+    """
+    if not torch.is_tensor(target_hidden) or target_hidden.ndim < 3:
+        raise ValueError(
+            "forecast target hidden must be a tensor with [..., rows, hidden] layout"
+        )
+    video_segments = [segment for segment in layout.segments if segment[2] == "video"]
+    if not video_segments:
+        raise ValueError("MiniMax H3 packed layout has no target-video segment")
+    start, stop, _kind = video_segments[-1]
+    video_rows = int(stop) - int(start)
+    if video_rows <= 0 or int(target_hidden.shape[-2]) < video_rows:
+        raise ValueError("forecast target hidden does not contain the target-video rows")
+
+    patch_size = tuple(int(value) for value in patch_size)
+    cube_shape = tuple(int(value) for value in cube_shape)
+    spatial = tuple(int(value) for value in tuple(video_shape)[-3:])
+    if len(spatial) != 3 or len(patch_size) != 3:
+        raise ValueError("video_shape and patch_size must expose T/H/W dimensions")
+    padded = tuple(
+        ((value + patch - 1) // patch) * patch
+        for value, patch in zip(spatial, patch_size)
+    )
+    grid_shape = tuple(
+        padded[axis] // patch_size[axis]
+        for axis in range(3)
+    )
+    if grid_shape[0] * grid_shape[1] * grid_shape[2] != video_rows:
+        raise ValueError(
+            "forecast target-video row count does not match the padded patch grid"
+        )
+
+    _forward, inverse = tile_aligned_cube_major_indices(
+        grid_shape,
+        int(start),
+        cube_shape,
+    )
+    index = torch.tensor(
+        inverse,
+        dtype=torch.long,
+        device=target_hidden.device,
+    )
+    restored = target_hidden.clone()
+    video = target_hidden[..., -video_rows:, :].index_select(-2, index)
+    restored[..., -video_rows:, :].copy_(video)
+    return restored
+
+
+def forecast_representation_contract(cube_shape=CUBE_SHAPE):
+    """Return the v1 adapter contract for an active non-raster H3 representation."""
+    cube_shape = tuple(int(value) for value in cube_shape)
+    return {
+        "api": FORECAST_INTEROP_API,
+        "scope": "final_block_target_hidden",
+        "representation": "cube_major_target_video",
+        "native_representation": "raster_target_video",
+        "video_token_order": cube_shape,
+        "to_native_target_hidden": partial(
+            restore_forecast_target_hidden_to_raster,
+            cube_shape=cube_shape,
+        ),
+    }
+
+
+def _publish_forecast_representation(model_patcher, cube_shape):
+    _transformer_options(model_patcher)[FORECAST_REPRESENTATION_KEY] = (
+        forecast_representation_contract(cube_shape)
+    )
+
+
+def _clear_forecast_representation(model_patcher):
+    _transformer_options(model_patcher).pop(FORECAST_REPRESENTATION_KEY, None)
+
+
 def clear(model_patcher):
+    _clear_forecast_representation(model_patcher)
     patches = getattr(model_patcher, "object_patches", {})
     current = patches.get(FORWARD_KEY)
     if current is None or not getattr(current, "_h3_cube_order", False):
@@ -323,9 +463,22 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
             % (tuple(model.patch_size),)
         )
 
+    incompatible = incompatible_forecast_consumers(model_patcher)
+    if incompatible:
+        _clear_forecast_representation(model_patcher)
+        logging.warning(
+            "%s using raster target-video order because forecast consumer(s) %s "
+            "bypass H3 _forward without forecast representation API v%d support",
+            LOG_PREFIX,
+            ", ".join(incompatible),
+            FORECAST_INTEROP_API,
+        )
+        return False
+
     original = model_patcher.get_model_object(FORWARD_KEY)
     if getattr(original, "_h3_cube_order", False):
         if getattr(original, "_h3_cube_order_shape", None) == cube_shape:
+            _publish_forecast_representation(model_patcher, cube_shape)
             return False
         raise H3CubeOrderPatchError("another H3 cube-order configuration is installed")
 
@@ -333,6 +486,7 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
         FORWARD_KEY,
         make_forward(model, original, cube_shape),
     )
+    _publish_forecast_representation(model_patcher, cube_shape)
     logging.debug(
         "%s armed: cube=%s edge_tokens_only=true",
         LOG_PREFIX,
@@ -344,15 +498,23 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
 __all__ = [
     "CUBE_SHAPE",
     "CUBE_SHAPES",
+    "FORECAST_BYPASS_WRAPPER_KEYS",
+    "FORECAST_CONSUMERS_KEY",
+    "FORECAST_INTEROP_API",
+    "FORECAST_REPRESENTATION_KEY",
     "FORWARD_KEY",
     "H3CubeOrderPatchError",
     "ROUTER_TILE",
+    "SPECTRUM_WRAPPER_KEY",
     "TOKEN_ORDER_SHAPES",
     "clear",
     "cube_major_indices",
+    "forecast_representation_contract",
+    "incompatible_forecast_consumers",
     "install",
     "make_forward",
     "reorder_target_positions",
     "reorder_video_patches",
+    "restore_forecast_target_hidden_to_raster",
     "tile_aligned_cube_major_indices",
 ]
