@@ -436,10 +436,8 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
                 "MiniMax H3 _forward returned an unexpected output contract"
             )
 
-        # The FinalLayer patch restores video rows to native raster order before
-        # unpatchify. This wrapper now owns only the padding crop, because it had
-        # to feed a padded pseudo-video into native _forward to express the row
-        # permutation as ordinary H3 input.
+        # FinalLayer restores target-video rows to native raster order before
+        # unpatchify. The _forward wrapper now owns only the padding crop.
         result = list(output)
         result[0] = result[0][
             :, :, :original_shape[0], :original_shape[1], :original_shape[2]
@@ -477,11 +475,27 @@ def get_state(model_patcher):
     return state if isinstance(state, CubeOrderState) else None
 
 
+def _clear_order_only_final_layer(model_patcher):
+    # Local import avoids a module cycle: FinalLayer imports CubeOrderState.
+    from .memory import final_layer as final_layer_patch
+
+    current = getattr(model_patcher, "object_patches", {}).get(
+        final_layer_patch.FINAL_LAYER_KEY
+    )
+    if (
+        current is not None
+        and getattr(current, final_layer_patch.OWNER_MARKER, False)
+        and getattr(current, final_layer_patch.SIGNATURE_MARKER, None) is None
+    ):
+        final_layer_patch.clear(model_patcher)
+
+
 def clear(model_patcher):
     state = get_state(model_patcher)
     if state is not None:
         state.clear()
     _transformer_options(model_patcher).pop(CUBE_STATE_KEY, None)
+    _clear_order_only_final_layer(model_patcher)
     patches = getattr(model_patcher, "object_patches", {})
     current = patches.get(FORWARD_KEY)
     if current is None or not getattr(current, "_h3_cube_order", False):
@@ -497,6 +511,30 @@ def clear(model_patcher):
     else:
         patches[FORWARD_KEY] = original
     return True
+
+
+def _install_final_layer_restore(model_patcher, state):
+    # Preserve an already-installed H3 memory chunk size; otherwise install the
+    # ordering-only wrapper. A foreign FinalLayer remains the computation base
+    # and is wrapped only by the pure row permutation.
+    from .memory import final_layer as final_layer_patch
+
+    current = getattr(model_patcher, "object_patches", {}).get(
+        final_layer_patch.FINAL_LAYER_KEY
+    )
+    chunk_rows = None
+    if current is not None and getattr(
+        current,
+        final_layer_patch.OWNER_MARKER,
+        False,
+    ):
+        chunk_rows = getattr(current, final_layer_patch.SIGNATURE_MARKER, None)
+    final_layer_patch.install(
+        model_patcher,
+        chunk_rows,
+        cube_state=state,
+        force_rebuild=True,
+    )
 
 
 def install(model_patcher, cube_shape=CUBE_SHAPE):
@@ -538,6 +576,7 @@ def install(model_patcher, cube_shape=CUBE_SHAPE):
         FORWARD_KEY,
         make_forward(model, original, cube_shape, state),
     )
+    _install_final_layer_restore(model_patcher, state)
     logging.debug(
         "%s armed: cube=%s edge_tokens_only=true restore=FinalLayer",
         LOG_PREFIX,
