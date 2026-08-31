@@ -1,5 +1,6 @@
 """CPU contracts for H3-owned cube-major token ordering."""
 
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -52,6 +53,24 @@ sys.argv = [sys.argv[0], *TEST_ARGS]
 
 def _raster_video(t, h, w):
     return torch.arange(t * h * w, dtype=torch.float32).reshape(1, 1, t, h, w)
+
+
+def _packed_layout_supports(name):
+    return name in inspect.signature(PackedLayout).parameters
+
+
+def _compatible_keyframe(frame_count):
+    # v0.33 only accepts first/last anchors; v0.34 generalized PackedLayout to
+    # arbitrary keyframe positions. Exercise the broader contract where it
+    # exists without feeding an impossible layout to the older release.
+    return 2 if not _packed_layout_supports("frame_count") else frame_count - 1
+
+
+def _packed_layout(*args, keyframes=None, refs=None, frame_count=None):
+    kwargs = {"keyframes": keyframes, "refs": refs}
+    if _packed_layout_supports("frame_count"):
+        kwargs["frame_count"] = frame_count
+    return PackedLayout(*args, **kwargs)
 
 
 class _FakePatcher:
@@ -165,8 +184,9 @@ class CubeOrderTests(unittest.TestCase):
             dtype=torch.float32,
         )
         padded_video = common_dit.pad_to_patch_size(video, patch_size)
+        frame_count = 5
         keyframes = [{
-            "resolved_frame_index": 2,
+            "resolved_frame_index": _compatible_keyframe(frame_count),
             "latent": torch.zeros(1, 24, 1, 34, 18),
             "audio_latent": torch.zeros(1, 32, 2, 2),
         }]
@@ -181,7 +201,7 @@ class CubeOrderTests(unittest.TestCase):
                 "ref_audio_t": 2,
             },
         ]
-        base_layout = PackedLayout(
+        base_layout = _packed_layout(
             context.shape[1],
             padded_video.shape[2],
             padded_video.shape[3],
@@ -189,12 +209,14 @@ class CubeOrderTests(unittest.TestCase):
             audio.shape[-1],
             keyframes=keyframes,
             refs=refs,
+            frame_count=frame_count,
         )
         original_position_ids = base_layout.position_ids.clone()
         payload = {
             "layout": base_layout,
             "keyframes": keyframes,
             "refs": refs,
+            "frame_count": frame_count,
             "sentinel": object(),
         }
         transformer_options = {"sentinel": object()}
@@ -297,6 +319,55 @@ class CubeOrderTests(unittest.TestCase):
                     base_layout.position_ids,
                     original_position_ids,
                 ))
+
+    def test_layout_fallback_preserves_supported_keyframe_metadata(self):
+        patch_size = (1, 2, 2)
+        video = _raster_video(5, 34, 18)
+        audio = torch.zeros(1, 32, 2, 3)
+        context = torch.zeros(1, 3, 8)
+        frame_count = 5
+        keyframe_index = _compatible_keyframe(frame_count)
+        keyframes = [{
+            "resolved_frame_index": keyframe_index,
+            "latent": torch.zeros(1, 24, 1, 34, 18),
+            "audio_latent": torch.zeros(1, 32, 2, 2),
+        }]
+        captured = {}
+        model = type("Model", (), {"patch_size": patch_size})()
+
+        def original(x, timestep, actual_context, actual_options, minimax_payload=None, **kwargs):
+            captured["layout"] = minimax_payload["layout"]
+            return [x[0].clone(), x[1]]
+
+        output = make_forward(model, original)(
+            [video, audio],
+            torch.tensor([500.0]),
+            context,
+            {},
+            minimax_payload={
+                "keyframes": keyframes,
+                "frame_count": frame_count,
+            },
+        )
+
+        self.assertTrue(torch.equal(output[0], video))
+        layout = captured["layout"]
+        cond_start, _cond_stop, _kind = next(
+            segment for segment in layout.segments if segment[2] == "cond"
+        )
+        expected = _packed_layout(
+            context.shape[1],
+            video.shape[2],
+            video.shape[3],
+            video.shape[4],
+            audio.shape[-1],
+            keyframes=keyframes,
+            frame_count=frame_count,
+        )
+        self.assertTrue(torch.equal(
+            layout.position_ids[cond_start],
+            expected.position_ids[cond_start],
+        ))
 
     def test_short_unalignable_grid_fails_before_downstream_forward(self):
         model = type("Model", (), {"patch_size": (1, 2, 2)})()
