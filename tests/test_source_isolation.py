@@ -23,13 +23,16 @@ class SourceIsolationTests(unittest.TestCase):
             'torch.cuda.empty_cache',
             'torch.cuda.synchronize',
         )
-        # The ban keeps stalls and allocator churn out of the hot path. The
-        # native self-test is the one place a synchronize is the point: it runs
-        # once at startup to catch asynchronous kernel faults, which surface
-        # only at a sync and would otherwise appear later as an unrelated bug.
+        # The ban keeps stalls and allocator churn out of the hot path. Native
+        # self-tests deliberately synchronize to surface asynchronous faults.
+        # The existing-dense adapter likewise synchronizes only in its cached
+        # one-time compatibility probe, never in steady-state attention.
         exempt = {
             SOURCE / 'native' / 'selftest.py': ('torch.cuda.synchronize',),
             SOURCE / 'native' / 'hip_selftest.py': ('torch.cuda.synchronize',),
+            SOURCE / 'attention' / 'sparse' / 'existing_dense_sparse.py': (
+                'torch.cuda.synchronize',
+            ),
         }
         for path in SOURCE.rglob('*.py'):
             text = path.read_text(encoding='utf-8')
