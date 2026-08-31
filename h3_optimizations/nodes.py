@@ -315,7 +315,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
             return 'unknown sparse backend %r' % backend
         if early_schedule is not None and early_schedule not in EARLY_SCHEDULE_OPTIONS:
             return 'unknown early schedule %r' % early_schedule
-        if video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
+        if video_token_order is not None and video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
             return 'unknown video token order %r' % video_token_order
         for name, value in (
             ('video_budget', video_budget),

@@ -25,6 +25,12 @@ from h3_optimizations import apply as base_apply  # noqa: E402
 from h3_optimizations import apply_policy  # noqa: F401,E402
 from h3_optimizations import amd_policy  # noqa: F401,E402
 from h3_optimizations import universal_sparse_fallback as universal  # noqa: E402
+from h3_optimizations.environment import (  # noqa: E402
+    BACKEND_CPU,
+    BACKEND_MPS,
+    BACKEND_NVIDIA_CUDA,
+    BACKEND_XPU,
+)
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_FORCE_BF16,
     H3OptimizationPlan,
@@ -52,7 +58,7 @@ class UniversalExistingDenseSparsePolicyTests(unittest.TestCase):
         universal._probe_results.clear()
         universal._runtime_fallback_warned = False
         self.environment = SimpleNamespace(
-            backend='cuda',
+            backend=BACKEND_NVIDIA_CUDA,
             device_index=0,
             cuda_available=True,
         )
@@ -96,6 +102,30 @@ class UniversalExistingDenseSparsePolicyTests(unittest.TestCase):
         self.assertFalse(qkv.fused)
         self.assertIn('stock Comfy QKV', qkv.reason)
         self.assertIn('runtime-probe', attention.reason)
+
+    def test_non_gpu_and_unavailable_nvidia_environments_keep_dense(self):
+        expected = (self.dense, self.qkv)
+        environments = (
+            SimpleNamespace(backend=BACKEND_CPU, cuda_available=False),
+            SimpleNamespace(backend=BACKEND_MPS, cuda_available=False),
+            SimpleNamespace(backend=BACKEND_XPU, cuda_available=False),
+            SimpleNamespace(backend=BACKEND_NVIDIA_CUDA, cuda_available=False),
+            SimpleNamespace(backend='cuda', cuda_available=True),
+        )
+        for environment in environments:
+            with self.subTest(backend=environment.backend):
+                with mock.patch.object(
+                    universal,
+                    '_PREVIOUS_RESOLVE_ATTENTION',
+                    return_value=expected,
+                ):
+                    actual = universal.resolve_attention(
+                        H3OptimizationPlan(sparse=SparseRequest()),
+                        self.model,
+                        SimpleNamespace(),
+                        environment,
+                    )
+                self.assertIs(actual, expected)
 
     def test_existing_sparse_result_is_left_unchanged(self):
         sparse = base_apply.ResolvedAttention(

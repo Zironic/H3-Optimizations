@@ -26,7 +26,10 @@ from h3_optimizations.nodes import (  # noqa: E402
     H3SparseAttention,
     H3SparseAttentionAdvanced,
 )
-from h3_optimizations.plan import EARLY_SCHEDULE_HOLD  # noqa: E402
+from h3_optimizations.plan import (  # noqa: E402
+    DEFAULT_VIDEO_TOKEN_ORDER,
+    EARLY_SCHEDULE_HOLD,
+)
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -44,6 +47,7 @@ class LinkedInputValidationTests(unittest.TestCase):
             'early_kv': 0.5,
             'late_steps': 0,
             'late_kv': 0.5,
+            'video_token_order': DEFAULT_VIDEO_TOKEN_ORDER,
         }
         for input_name in defaults:
             with self.subTest(input_name=input_name):

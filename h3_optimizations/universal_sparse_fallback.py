@@ -26,6 +26,7 @@ from .attention.sparse.existing_dense_sparse import (
     ExistingDenseSparseError,
     ExistingDenseSparseSpec,
 )
+from .environment import BACKEND_NVIDIA_CUDA, BACKEND_ROCM
 from .plan import (
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
@@ -389,9 +390,12 @@ def resolve_attention(plan, model, inventory, environment):
     # the CUDA device type for both NVIDIA and ROCm, but other accelerators and
     # partial/synthetic resolver environments must retain their dense result.
     runtime_backend = getattr(environment, 'backend', None)
-    if runtime_backend not in ('cuda', 'rocm'):
+    if runtime_backend not in (BACKEND_NVIDIA_CUDA, BACKEND_ROCM):
         return resolved
-    if not bool(getattr(environment, 'cuda_available', False)):
+    if (
+        runtime_backend == BACKEND_NVIDIA_CUDA
+        and not bool(getattr(environment, 'cuda_available', False))
+    ):
         return resolved
 
     backend_kind = getattr(attention, 'backend_kind', None)

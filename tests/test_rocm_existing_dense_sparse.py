@@ -45,7 +45,7 @@ class RDNA2PolicyTests(unittest.TestCase):
         self.environment = SimpleNamespace(
             backend=BACKEND_ROCM,
             device_index=0,
-            cuda_available=True,
+            cuda_available=False,
         )
         self.model = SimpleNamespace(model_options={'transformer_options': {}})
         self.dense_resolution = SimpleNamespace(

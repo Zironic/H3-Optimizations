@@ -357,6 +357,10 @@ def format_sparse_status(model):
         attention_line = 'Attention: FP8 FlexAttention'
     elif selected == 'frost_bf16_sm89':
         attention_line = 'Attention: FROST BF16 (SM89)'
+    elif selected == 'sparse_kitchen_int8':
+        attention_line = 'Attention: Comfy Kitchen INT8 Sparse'
+    elif selected == 'existing_dense_sparse':
+        attention_line = 'Attention: Existing Dense Sparse'
     else:
         attention_line = 'Attention: %s' % selected
 

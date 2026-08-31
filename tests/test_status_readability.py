@@ -105,6 +105,32 @@ class QKVStatusReadabilityTests(unittest.TestCase):
 
         self.assertNotIn('Sparse fallback:', text)
 
+    def test_kitchen_attention_uses_a_readable_name(self):
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: self.status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Attention: Comfy Kitchen INT8 Sparse', text)
+        self.assertNotIn('sparse_kitchen_int8', text)
+
+    def test_existing_dense_sparse_attention_uses_a_readable_name(self):
+        status = dict(self.status)
+        status['attention'] = {'selected': 'existing_dense_sparse'}
+        model = SimpleNamespace(
+            model_options={
+                'transformer_options': {STATUS_KEY: status},
+            }
+        )
+
+        text = format_sparse_status(model)
+
+        self.assertIn('Attention: Existing Dense Sparse', text)
+        self.assertNotIn('existing_dense_sparse', text)
+
     def test_auto_sparse_sage_is_labeled_as_fallback(self):
         status = dict(self.status)
         status['attention'] = {
