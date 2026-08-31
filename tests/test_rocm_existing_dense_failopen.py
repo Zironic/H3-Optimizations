@@ -129,7 +129,12 @@ class RDNA2ExistingDenseFailOpenTests(unittest.TestCase):
         self.assertIs(output, existing_dense_sparse.attention_output_buffer(source))
         output.fill_(7)
         self.assertFalse(torch.equal(output, residual))
-        self.assertTrue(torch.equal(residual, torch.arange(32).reshape(4, 8)))
+        self.assertTrue(
+            torch.equal(
+                residual,
+                torch.arange(32, dtype=torch.float32).reshape(4, 8),
+            )
+        )
 
 
 if __name__ == '__main__':
