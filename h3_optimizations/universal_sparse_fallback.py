@@ -1,17 +1,15 @@
 '''Universal final sparse fallback over ComfyUI's existing dense attention.
 
-This layer runs after the ordinary sparse resolver (and the experimental AMD
-policy). It changes nothing while Kitchen, Sparse Sage, BF16 Triton, FROST, or
-FlexAttention resolves successfully. If Auto would otherwise fall all the way
-back to ordinary existing ComfyUI attention, it gets one last architecture-
-neutral sparse attempt: H3 routing packs the selected K/V rows and hands each
-small problem back to the same dense attention consumer that already works on
-the device.
+This layer runs after the ordinary sparse resolver and AMD policy. It changes
+nothing while a specialized sparse backend resolves successfully. If Auto would
+otherwise fall all the way back to ordinary existing ComfyUI attention, it gets
+one last architecture-neutral sparse attempt: H3 routing packs selected K/V rows
+and hands each smaller problem back to the dense attention consumer that already
+works on the device.
 
-The adapter is deliberately runtime-probed using the actual Q/K/V dtype. Probe,
-routing, packing, or consumer failures fail open to the original dense problem,
-so this final fallback cannot turn an otherwise-working dense H3 path into a
-hard generation failure.
+The adapter is runtime-probed using the actual Q/K/V dtype. Probe, routing,
+packing, or consumer failures fail open to the original dense problem, so this
+fallback cannot turn an otherwise-working dense H3 path into a hard failure.
 '''
 
 from __future__ import annotations
@@ -50,7 +48,7 @@ _runtime_fallback_warned = False
 
 
 def _validate_qkv(q, k, v):
-    if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
+    if q.shape != k.shape or q.shape != v.shape or len(q.shape) != 4:
         raise ExistingDenseSparseError(
             'existing-dense sparse attention requires equal HND rank-4 Q/K/V'
         )
@@ -92,10 +90,9 @@ def _warn_runtime_fallback(scope, error):
     )
 
 
-# existing_dense_sparse predates the universal policy and originally carried
-# RDNA2-specific BF16 validation/log wording. Its routing/packing implementation
-# is architecture-neutral; install the universal runtime contract here after the
-# AMD policy has loaded.
+# The original adapter was introduced for RDNA2 and had BF16-only validation
+# and RDNA2-specific logging. Routing and packing are architecture-neutral, so
+# install the universal runtime contract after the AMD policy has loaded.
 _dense_sparse._validate_qkv = _validate_qkv
 _dense_sparse._warn_runtime_fallback = _warn_runtime_fallback
 
@@ -126,7 +123,8 @@ def _probe_case(device, transformer_options, *, q_rows, k_rows, batch, dtype):
             % (tuple(actual.shape), dtype, tuple(q.shape))
         )
     expected = _dense_sparse._reference_attention(q, k, v)
-    torch.cuda.synchronize(device)
+    # The scalar reads below synchronize naturally. An explicit device-wide
+    # synchronize would add an unnecessary global stall to this one-time probe.
     finite = bool(torch.isfinite(actual).all())
     rel_l2 = _dense_sparse._relative_l2(actual, expected)
     max_abs = (actual.float() - expected.float()).abs().max().item()
@@ -152,8 +150,8 @@ def _probe_geometry(device, transformer_options, q_tile, kv_tile, dtype):
             dtype=dtype,
         )
 
-    # Batching only affects efficiency. If the dense consumer rejects larger
-    # packed batches, progressively reduce them without changing the route.
+    # Batching only affects efficiency. If the consumer rejects a larger packed
+    # batch, progressively reduce it without changing the route.
     for batch in (16, 8, 4, 2):
         try:
             _probe_case(
@@ -234,9 +232,8 @@ class UniversalExistingDenseSparseBackend(ExistingDenseSparseBackend):
     name = SELECTED_EXISTING_DENSE_SPARSE
 
     def __init__(self, config=None):
-        # The installer needs a stable backend before real QKV exists. The first
-        # invocation replaces this placeholder with a geometry proven for the
-        # actual dense consumer and dtype.
+        # Placeholder geometry satisfies installation before real QKV exists.
+        # The first invocation replaces it with a geometry proven for its dtype.
         super().__init__(config, spec=ExistingDenseSparseSpec(64, 64, 1))
         self._runtime_spec_lock = threading.Lock()
         self._runtime_dtype = None
@@ -314,13 +311,13 @@ def _stock_qkv_allowed(plan):
     )
 
 
-def _resolve_final_fallback(plan, attention, qkv):
-    # Unknown explicit attention overrides are classified as existing_full_q;
-    # keep their single-call contract rather than probing/packing them.
+def _resolve_final_fallback(plan, attention):
+    # Unknown explicit attention overrides are existing_full_q; preserve their
+    # single-call contract rather than probing and repacking them.
     if attention.backend_kind != _base.ATTENTION_EXISTING:
-        return attention, qkv
+        return None
     if not _stock_qkv_allowed(plan):
-        return attention, qkv
+        return None
 
     config = _base.HybridSparseConfig(
         mode=_base.MODE_SAGE128,
@@ -345,8 +342,8 @@ def _resolve_final_fallback(plan, attention, qkv):
             selected=SELECTED_EXISTING_DENSE_SPARSE,
             backend=backend,
             reason=reason,
-            # Reuse the generic sparse installation category. The backend itself
-            # launches no Triton; this only opts into the sparse runtime wrapper.
+            # This opts into the generic sparse runtime wrapper. The backend
+            # itself launches no Triton.
             backend_kind=_base.ATTENTION_TRITON_SPARSE,
             projector=None,
             dense_resolution=attention.dense_resolution,
@@ -356,23 +353,37 @@ def _resolve_final_fallback(plan, attention, qkv):
 
 
 def resolve_attention(plan, model, inventory, environment):
-    attention, qkv = _PREVIOUS_RESOLVE_ATTENTION(
+    # Preserve the previous resolver's tuple object exactly whenever this layer
+    # does not promote the result. Several callers/tests rely on that contract.
+    resolved = _PREVIOUS_RESOLVE_ATTENTION(
         plan,
         model,
         inventory,
         environment,
     )
+    if not isinstance(resolved, tuple) or len(resolved) != 2:
+        return resolved
+    attention, _qkv = resolved
+
     sparse = getattr(plan, 'sparse', None)
     if sparse is None or sparse.backend != SPARSE_BACKEND_AUTO:
-        return attention, qkv
+        return resolved
 
-    # A previous layer may already have produced an actual sparse backend. In
-    # particular, RDNA2's tested fallback currently resolves before this layer.
-    if attention.backend_kind in _base.SPARSE_EXECUTION_BACKENDS:
-        return attention, qkv
+    # The adapter uses PyTorch's CUDA device type for both NVIDIA and ROCm. CPU,
+    # MPS, and synthetic environments should retain the already-working dense
+    # result rather than installing an unusable sparse backend.
+    if not bool(getattr(environment, 'cuda_available', False)):
+        return resolved
+
+    backend_kind = getattr(attention, 'backend_kind', None)
+    if backend_kind is None:
+        return resolved
+    if backend_kind in _base.SPARSE_EXECUTION_BACKENDS:
+        return resolved
 
     try:
-        return _resolve_final_fallback(plan, attention, qkv)
+        promoted = _resolve_final_fallback(plan, attention)
+        return resolved if promoted is None else promoted
     except Exception as error:
         logging.warning(
             '%s universal existing-dense sparse fallback could not be installed; '
@@ -381,7 +392,7 @@ def resolve_attention(plan, model, inventory, environment):
             type(error).__name__,
             error,
         )
-        return attention, qkv
+        return resolved
 
 
 resolve_attention._h3_universal_sparse_fallback = True
