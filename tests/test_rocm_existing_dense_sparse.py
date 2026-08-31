@@ -28,10 +28,13 @@ from h3_optimizations.attention.sparse import existing_dense_sparse  # noqa: E40
 from h3_optimizations.environment import BACKEND_ROCM  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     H3OptimizationPlan,
+    MemoryRequest,
     SparseRequest,
+    QKV_STREAMING_FORCED,
     SPARSE_BACKEND_FLEX,
     SPARSE_BACKEND_TRITON,
 )
+from h3_optimizations.qkv.providers import QKV_STANDARD  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -48,10 +51,7 @@ class RDNA2PolicyTests(unittest.TestCase):
             backend_kind=base_apply.ATTENTION_EXISTING,
         )
 
-    def test_auto_skips_known_dead_backends_then_uses_dense_adapter(self):
-        spec = existing_dense_sparse.ExistingDenseSparseSpec(64, 64, 8)
-        qkv = object()
-        projector = object()
+    def test_auto_skips_known_dead_backends_and_defers_probe_to_runtime(self):
         with (
             mock.patch.object(amd_policy, '_is_rdna2', return_value=True),
             mock.patch.object(
@@ -63,13 +63,9 @@ class RDNA2PolicyTests(unittest.TestCase):
                 side_effect=base_apply.FP8FlexError('flex unavailable'),
             ),
             mock.patch.object(
-                amd_policy, 'probe_existing_dense_sparse', return_value=spec
-            ),
-            mock.patch.object(
-                amd_policy, '_resolve_qkv', return_value=(qkv, projector)
-            ),
-            mock.patch.object(
-                amd_policy, '_fallback_device', return_value=torch.device('cpu')
+                amd_policy,
+                'probe_rdna2_existing_dense_sparse',
+                side_effect=AssertionError('runtime probe must not run at resolution'),
             ),
             mock.patch.object(
                 amd_policy,
@@ -84,13 +80,38 @@ class RDNA2PolicyTests(unittest.TestCase):
                 self.environment,
             )
 
-        self.assertIs(resolved_qkv, qkv)
-        self.assertIs(attention.projector, projector)
+        self.assertEqual(resolved_qkv.provider_id, QKV_STANDARD)
+        self.assertFalse(resolved_qkv.fused)
+        self.assertIsNone(attention.projector)
+        self.assertIsInstance(
+            attention.backend,
+            amd_policy.RDNA2ExistingDenseSparseBackend,
+        )
         self.assertEqual(
             attention.selected,
             amd_policy.SELECTED_EXISTING_DENSE_SPARSE,
         )
-        self.assertIn('skips Kitchen INT8, Sparse Sage, and BF16 Triton', attention.reason)
+        self.assertIn('actual QKV dtype', attention.reason)
+
+    def test_rdna2_adapter_preserves_stock_qkv(self):
+        qkv, projector = amd_policy._resolve_qkv(
+            H3OptimizationPlan(sparse=SparseRequest())
+        )
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertFalse(qkv.fused)
+        self.assertIsNone(projector)
+        self.assertIn('stock Comfy QKV projection', qkv.reason)
+
+    def test_forced_qkv_streaming_disables_adapter(self):
+        plan = H3OptimizationPlan(
+            memory=MemoryRequest(qkv_streaming=QKV_STREAMING_FORCED),
+            sparse=SparseRequest(),
+        )
+        with self.assertRaisesRegex(
+            existing_dense_sparse.ExistingDenseSparseError,
+            'does not override explicitly forced QKV execution',
+        ):
+            amd_policy._resolve_qkv(plan)
 
     def test_auto_keeps_working_flex(self):
         expected = (object(), object())
@@ -102,7 +123,7 @@ class RDNA2PolicyTests(unittest.TestCase):
             mock.patch.object(base_apply, '_resolve_fp8_flex', return_value=expected),
             mock.patch.object(
                 amd_policy,
-                'probe_existing_dense_sparse',
+                'probe_rdna2_existing_dense_sparse',
                 side_effect=AssertionError('adapter must not probe'),
             ),
         ):
@@ -172,6 +193,89 @@ class RDNA2PolicyTests(unittest.TestCase):
                 object(), self.environment, object(), None
             )
         architecture.assert_called_once_with(self.environment)
+
+
+class RDNA2RuntimeProbeTests(unittest.TestCase):
+    def setUp(self):
+        amd_policy._rdna2_probe_results.clear()
+
+    def test_probe_cache_is_dtype_specific(self):
+        calls = []
+
+        def geometry(_device, _options, q_tile, kv_tile, dtype):
+            calls.append((q_tile, kv_tile, dtype))
+            return 4
+
+        with (
+            mock.patch.object(
+                existing_dense_sparse,
+                '_probe_key',
+                return_value=('device', 'consumer'),
+            ),
+            mock.patch.object(
+                amd_policy,
+                '_probe_geometry_dtype',
+                side_effect=geometry,
+            ),
+        ):
+            bf16 = amd_policy.probe_rdna2_existing_dense_sparse(
+                device='cpu', dtype=torch.bfloat16
+            )
+            fp32 = amd_policy.probe_rdna2_existing_dense_sparse(
+                device='cpu', dtype=torch.float32
+            )
+            bf16_cached = amd_policy.probe_rdna2_existing_dense_sparse(
+                device='cpu', dtype=torch.bfloat16
+            )
+
+        self.assertEqual((bf16.q_tile, bf16.kv_tile), (64, 64))
+        self.assertEqual((fp32.q_tile, fp32.kv_tile), (64, 64))
+        self.assertIs(bf16_cached, bf16)
+        self.assertEqual(
+            calls,
+            [
+                (64, 64, torch.bfloat16),
+                (64, 64, torch.float32),
+            ],
+        )
+
+    def test_validator_accepts_h3_bf16_and_fp32(self):
+        for dtype in (torch.bfloat16, torch.float32):
+            q = SimpleNamespace(
+                shape=(1, 2, 8, 128),
+                ndim=4,
+                dtype=dtype,
+                device='cuda:0',
+                is_cuda=True,
+                stride=lambda dim: 1,
+            )
+            amd_policy._validate_rdna2_qkv(q, q, q)
+
+    def test_runtime_probe_failure_prepares_dense_fallback(self):
+        backend = amd_policy.RDNA2ExistingDenseSparseBackend()
+        q = torch.empty((1, 2, 8, 128), dtype=torch.float32)
+        with (
+            mock.patch.object(
+                amd_policy,
+                '_validate_rdna2_qkv',
+                return_value=None,
+            ),
+            mock.patch.object(
+                amd_policy,
+                'probe_rdna2_existing_dense_sparse',
+                side_effect=RuntimeError('runtime rejected dtype'),
+            ),
+        ):
+            prepared = backend.prepare(
+                q,
+                q,
+                q,
+                layer_index=3,
+                transformer_options={},
+            )
+        self.assertIsNotNone(prepared.fallback_reason)
+        self.assertIn('runtime rejected dtype', prepared.fallback_reason)
+        self.assertIs(prepared.q, q)
 
 
 if __name__ == '__main__':
