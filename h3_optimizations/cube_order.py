@@ -349,6 +349,7 @@ def _spectrum_state_conditioned_residual(transformer_options):
 def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
     patch_size = tuple(int(value) for value in model.patch_size)
     cube_shape = tuple(int(value) for value in cube_shape)
+    standalone_restore = state is None
     state = CubeOrderState(cube_shape) if state is None else state
 
     def cube_order_forward(
@@ -436,9 +437,20 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
                 "MiniMax H3 _forward returned an unexpected output contract"
             )
 
-        # FinalLayer restores target-video rows to native raster order before
-        # unpatchify. The _forward wrapper now owns only the padding crop.
         result = list(output)
+        if standalone_restore:
+            inverse_index = torch.tensor(
+                inverse,
+                dtype=torch.long,
+                device=result[0].device,
+            )
+            result[0] = reorder_video_patches(
+                result[0],
+                inverse_index,
+                patch_size,
+            )
+        # Installed operation restores rows inside FinalLayer; both paths still
+        # need the crop because cube ordering fed padded video into native _forward.
         result[0] = result[0][
             :, :, :original_shape[0], :original_shape[1], :original_shape[2]
         ]
@@ -476,7 +488,6 @@ def get_state(model_patcher):
 
 
 def _clear_order_only_final_layer(model_patcher):
-    # Local import avoids a module cycle: FinalLayer imports CubeOrderState.
     from .memory import final_layer as final_layer_patch
 
     current = getattr(model_patcher, "object_patches", {}).get(
@@ -514,11 +525,13 @@ def clear(model_patcher):
 
 
 def _install_final_layer_restore(model_patcher, state):
-    # Preserve an already-installed H3 memory chunk size; otherwise install the
-    # ordering-only wrapper. A foreign FinalLayer remains the computation base
-    # and is wrapped only by the pure row permutation.
     from .memory import final_layer as final_layer_patch
 
+    model = model_patcher.get_model_object("diffusion_model")
+    if getattr(model, "final_layer", None) is None:
+        # Keeps the low-level cube-order helper usable with deliberately minimal
+        # test/dummy models. Real MiniMaxH3Model always owns FinalLayer.
+        return
     current = getattr(model_patcher, "object_patches", {}).get(
         final_layer_patch.FINAL_LAYER_KEY
     )
