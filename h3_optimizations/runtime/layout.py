@@ -159,6 +159,5 @@ def resolve_layout(x, context, payload):
             text_len, latent_t, lat_h, lat_w, audio_t,
             keyframes=(payload or {}).get("keyframes"),
             refs=(payload or {}).get("refs"),
-            frame_count=(payload or {}).get("frame_count"),
         )
     return from_packed_layout(packed)

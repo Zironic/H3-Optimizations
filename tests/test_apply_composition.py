@@ -27,6 +27,7 @@ from comfy.model_patcher import ModelPatcher  # noqa: E402
 import comfy.patcher_extension  # noqa: E402
 from comfy_extras.nodes_model_advanced import ModelAttentionBackend  # noqa: E402
 import h3_optimizations.apply as apply_module  # noqa: E402
+from h3_optimizations.cube_order import TOKEN_ORDER_SHAPES  # noqa: E402
 from h3_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
@@ -34,9 +35,12 @@ from h3_optimizations.plan import (  # noqa: E402
     MemoryRequest,
     QKV_STREAMING_OFF,
     SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     STATUS_KEY,
     PLAN_KEY,
+    VIDEO_TOKEN_ORDER_REQUESTS,
+    VIDEO_TOKEN_ORDER_RASTER,
     read_plan,
 )
 from h3_optimizations.qkv.providers import (  # noqa: E402
@@ -513,6 +517,91 @@ class ApplyCompositionTests(unittest.TestCase):
             left_status['sparse']['denser_early_late_steps']
         )
 
+    def test_public_backends_share_token_order_installation_contract(self):
+        inventory = SimpleNamespace(
+            labels=lambda _name: (),
+            out_proj_plain_float=False,
+        )
+        environment = SimpleNamespace(
+            cuda_available=True,
+            capability=(8, 9),
+            device_name='fake SM89',
+            backend='nvidia_cuda',
+            architecture='sm89',
+        )
+        attention = apply_module.ResolvedAttention(
+            requested='synthetic',
+            selected=apply_module.ATTENTION_SPARSE,
+            backend=SimpleNamespace(
+                name=apply_module.ATTENTION_SPARSE,
+                as_status=lambda: {},
+            ),
+            reason='synthetic sparse backend',
+            backend_kind=apply_module.ATTENTION_SPARSE,
+        )
+        qkv = QKVProviderResolution(
+            QKV_STANDARD,
+            False,
+            'standard projection',
+        )
+        mlp = MLPProviderResolution('off', 'off', 'disabled')
+
+        with mock.patch.object(
+            apply_module,
+            'is_minimax_h3',
+            return_value=True,
+        ), mock.patch.object(
+            apply_module,
+            'get_h3_blocks',
+            return_value=(object(),),
+        ), mock.patch.object(
+            apply_module,
+            'inspect_h3_linears',
+            return_value=inventory,
+        ), mock.patch.object(
+            apply_module.RuntimeEnvironment,
+            'detect',
+            return_value=environment,
+        ), mock.patch.object(
+            apply_module,
+            '_resolve_attention',
+            return_value=(attention, qkv),
+        ), mock.patch.object(
+            apply_module,
+            'configure_backend',
+            return_value=(object(), 1),
+        ), mock.patch.object(
+            apply_module,
+            '_install_mlp',
+            return_value=(mlp, 0),
+        ), mock.patch.object(
+            apply_module,
+            '_ensure_sparse_runtime',
+            return_value=(object(), True),
+        ):
+            for backend in SPARSE_BACKEND_PUBLIC_REQUESTS:
+                for token_order in VIDEO_TOKEN_ORDER_REQUESTS:
+                    with self.subTest(
+                        backend=backend,
+                        token_order=token_order,
+                    ):
+                        self.install_cube_order.reset_mock()
+                        patched = apply_module.apply_plan(
+                            FakeModel(),
+                            H3OptimizationPlan(sparse=SparseRequest(
+                                backend=backend,
+                                video_token_order=token_order,
+                            )),
+                        )
+                        cube_shape = TOKEN_ORDER_SHAPES[token_order]
+                        if cube_shape is None:
+                            self.install_cube_order.assert_not_called()
+                        else:
+                            self.install_cube_order.assert_called_once_with(
+                                patched,
+                                cube_shape,
+                            )
+
     def test_missing_sparse_backend_preserves_dense_h3(self):
         inventory = SimpleNamespace(labels=lambda _name: ())
         qkv = QKVProviderResolution(
@@ -537,6 +626,9 @@ class ApplyCompositionTests(unittest.TestCase):
             architecture='cpu',
         )
         plan = H3OptimizationPlan().with_sparse(SparseRequest())
+        raster_plan = H3OptimizationPlan().with_sparse(SparseRequest(
+            video_token_order=VIDEO_TOKEN_ORDER_RASTER,
+        ))
 
         with mock.patch.object(
             apply_module,
@@ -582,6 +674,10 @@ class ApplyCompositionTests(unittest.TestCase):
             '_ensure_sparse_runtime',
         ) as sparse_runtime:
             patched = apply_module.apply_plan(FakeModel(), plan)
+            raster_patched = apply_module.apply_plan(
+                FakeModel(),
+                raster_plan,
+            )
 
         status = patched.model_options['transformer_options'][STATUS_KEY]
         self.assertEqual(status['attention']['requested'], 'sparse_sage')
@@ -593,6 +689,10 @@ class ApplyCompositionTests(unittest.TestCase):
         self.assertIn('Sparse fallback:', format_sparse_status(patched))
         self.assertIn('Video token order: 1x8x8', format_sparse_status(patched))
         self.install_cube_order.assert_called_once_with(patched, (1, 8, 8))
+        self.assertIn(
+            'Video token order: Raster (stock H3 order)',
+            format_sparse_status(raster_patched),
+        )
         configure.assert_not_called()
         sparse_runtime.assert_not_called()
 

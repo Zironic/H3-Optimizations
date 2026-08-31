@@ -35,6 +35,7 @@ from h3_optimizations.runtime.context import (  # noqa: E402
 )
 from comfy.model_patcher import ModelPatcher  # noqa: E402
 from comfy.patcher_extension import CallbacksMP, WrappersMP  # noqa: E402
+from h3_optimizations.runtime.layout import resolve_layout  # noqa: E402
 
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
@@ -97,6 +98,22 @@ class RuntimeTests(unittest.TestCase):
             ],
             [10, 10, 10],
         )
+
+    def test_resolve_layout_rebuilds_current_packed_layout_for_odd_video(self):
+        video = torch.zeros(1, 24, 3, 9, 11)
+        audio = torch.zeros(1, 32, 2, 4)
+        context = torch.zeros(1, 5, 8)
+        payload = {"frame_count": 81}
+
+        layout = resolve_layout([video, audio], context, payload)
+
+        self.assertEqual(layout.text_range, (0, 5))
+        self.assertEqual(layout.audio_range, (5, 13))
+        self.assertEqual(layout.video_range, (13, 103))
+        self.assertEqual(layout.video_shape, (3, 5, 6))
+        self.assertEqual(layout.audio_t, 4)
+        self.assertEqual(layout.seq_len, 103)
+        self.assertEqual(payload, {"frame_count": 81})
 
     def test_outer_wrapper_preserves_and_extends_the_callback(self):
         session = H3RuntimeSession()

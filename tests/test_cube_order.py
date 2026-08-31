@@ -20,7 +20,12 @@ comfy.options.enable_args_parsing()
 
 import torch  # noqa: E402
 
-from comfy.ldm.minimax.model import MiniMaxH3Model, patchify_video  # noqa: E402
+from comfy.ldm import common_dit  # noqa: E402
+from comfy.ldm.minimax.model import (  # noqa: E402
+    MiniMaxH3Model,
+    PackedLayout,
+    patchify_video,
+)
 from h3_optimizations.cube_order import (  # noqa: E402
     CUBE_SHAPE,
     CUBE_SHAPES,
@@ -31,6 +36,8 @@ from h3_optimizations.cube_order import (  # noqa: E402
     cube_major_indices,
     install,
     make_forward,
+    pad_mask,
+    reorder_video_patches,
     tile_aligned_cube_major_indices,
 )
 from h3_optimizations.plan import (  # noqa: E402
@@ -139,6 +146,180 @@ class CubeOrderTests(unittest.TestCase):
             )
         )
         self.assertEqual(layout.h3_cube_order["cube_shape"], CUBE_SHAPE)
+
+    def test_all_geometries_preserve_padding_masks_and_mixed_layout(self):
+        patch_size = (1, 2, 2)
+        video = _raster_video(5, 33, 17)
+        audio = torch.arange(1 * 32 * 2 * 3, dtype=torch.float32).reshape(
+            1, 32, 2, 3
+        )
+        context = torch.zeros(1, 3, 8)
+        denoise_mask = torch.linspace(
+            0.0,
+            1.0,
+            5 * 33 * 17,
+            dtype=torch.float32,
+        ).reshape(1, 1, 5, 33, 17)
+        audio_denoise_mask = torch.tensor(
+            [[[[0.0, 0.5, 1.0], [1.0, 0.5, 0.0]]]],
+            dtype=torch.float32,
+        )
+        padded_video = common_dit.pad_to_patch_size(video, patch_size)
+        keyframes = [{
+            "resolved_frame_index": 2,
+            "latent": torch.zeros(1, 24, 1, 34, 18),
+            "audio_latent": torch.zeros(1, 32, 2, 2),
+        }]
+        refs = [
+            {"kind": "image", "latent_h": 34, "latent_w": 18},
+            {"kind": "audio", "ref_audio_t": 2},
+            {
+                "kind": "video_audio",
+                "latent_t": 2,
+                "latent_h": 34,
+                "latent_w": 18,
+                "ref_audio_t": 2,
+            },
+        ]
+        base_layout = PackedLayout(
+            context.shape[1],
+            padded_video.shape[2],
+            padded_video.shape[3],
+            padded_video.shape[4],
+            audio.shape[-1],
+            keyframes=keyframes,
+            refs=refs,
+        )
+        original_position_ids = base_layout.position_ids.clone()
+        payload = {
+            "layout": base_layout,
+            "keyframes": keyframes,
+            "refs": refs,
+            "sentinel": object(),
+        }
+        transformer_options = {"sentinel": object()}
+        model = type("Model", (), {"patch_size": patch_size})()
+        sentinel = object()
+
+        for cube_shape in CUBE_SHAPES:
+            with self.subTest(cube_shape=cube_shape):
+                captured = {}
+
+                def original(
+                    x,
+                    timestep,
+                    actual_context,
+                    actual_options,
+                    minimax_payload=None,
+                    denoise_mask=None,
+                    audio_denoise_mask=None,
+                    **kwargs,
+                ):
+                    captured["video"] = x[0]
+                    captured["audio"] = x[1]
+                    captured["context"] = actual_context
+                    captured["options"] = actual_options
+                    captured["layout"] = minimax_payload["layout"]
+                    captured["denoise_mask"] = denoise_mask
+                    captured["audio_denoise_mask"] = audio_denoise_mask
+                    return (x[0].clone(), x[1], sentinel)
+
+                output = make_forward(model, original, cube_shape)(
+                    (video, audio),
+                    torch.tensor([500.0]),
+                    context,
+                    transformer_options,
+                    minimax_payload=payload,
+                    denoise_mask=denoise_mask,
+                    audio_denoise_mask=audio_denoise_mask,
+                )
+
+                self.assertIsInstance(output, tuple)
+                self.assertTrue(torch.equal(output[0], video))
+                self.assertIs(output[1], audio)
+                self.assertIs(output[2], sentinel)
+                self.assertIs(captured["audio"], audio)
+                self.assertIs(captured["context"], context)
+                self.assertIs(captured["options"], transformer_options)
+                self.assertIs(
+                    captured["audio_denoise_mask"],
+                    audio_denoise_mask,
+                )
+                self.assertEqual(captured["video"].shape, padded_video.shape)
+                self.assertEqual(captured["video"].dtype, video.dtype)
+
+                ordered_layout = captured["layout"]
+                self.assertIsNot(ordered_layout, base_layout)
+                video_start, video_stop, _kind = next(
+                    segment
+                    for segment in ordered_layout.segments
+                    if segment[2] == "video"
+                )
+                order, _inverse = tile_aligned_cube_major_indices(
+                    (5, 17, 9),
+                    video_start,
+                    cube_shape,
+                )
+                expected_rows = patchify_video(padded_video, patch_size)[
+                    list(order)
+                ]
+                self.assertTrue(torch.equal(
+                    patchify_video(captured["video"], patch_size),
+                    expected_rows,
+                ))
+                expected_mask = reorder_video_patches(
+                    pad_mask(denoise_mask, padded_video.shape),
+                    order,
+                    patch_size,
+                )
+                self.assertTrue(torch.equal(
+                    captured["denoise_mask"],
+                    expected_mask,
+                ))
+                self.assertTrue(torch.equal(
+                    ordered_layout.position_ids[:video_start],
+                    original_position_ids[:video_start],
+                ))
+                self.assertTrue(torch.equal(
+                    ordered_layout.position_ids[video_start:video_stop],
+                    original_position_ids[video_start:video_stop][list(order)],
+                ))
+                self.assertEqual(
+                    ordered_layout.h3_cube_order["cube_shape"],
+                    cube_shape,
+                )
+                self.assertEqual(
+                    ordered_layout.h3_cube_order["grid_shape"],
+                    (5, 17, 9),
+                )
+                self.assertIs(payload["layout"], base_layout)
+                self.assertTrue(torch.equal(
+                    base_layout.position_ids,
+                    original_position_ids,
+                ))
+
+    def test_short_unalignable_grid_fails_before_downstream_forward(self):
+        model = type("Model", (), {"patch_size": (1, 2, 2)})()
+        called = False
+
+        def original(*args, **kwargs):
+            nonlocal called
+            called = True
+            return args[0]
+
+        wrapped = make_forward(model, original)
+        with self.assertRaisesRegex(
+            ValueError,
+            "video grid cannot satisfy the router alignment prefix",
+        ):
+            wrapped(
+                [_raster_video(1, 3, 3), torch.zeros(1, 32, 2, 1)],
+                torch.tensor([500.0]),
+                torch.zeros(1, 3, 8),
+                {},
+                minimax_payload={},
+            )
+        self.assertFalse(called)
 
     def test_token_order_mapping_has_three_cube_arms_and_stock_raster(self):
         self.assertEqual(
