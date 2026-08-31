@@ -369,9 +369,12 @@ def resolve_attention(plan, model, inventory, environment):
     if sparse is None or sparse.backend != SPARSE_BACKEND_AUTO:
         return resolved
 
-    # The adapter uses PyTorch's CUDA device type for both NVIDIA and ROCm. CPU,
-    # MPS, and synthetic environments should retain the already-working dense
-    # result rather than installing an unusable sparse backend.
+    # Only explicit CUDA/ROCm runtime environments are eligible. PyTorch uses
+    # the CUDA device type for both NVIDIA and ROCm, but other accelerators and
+    # partial/synthetic resolver environments must retain their dense result.
+    runtime_backend = getattr(environment, 'backend', None)
+    if runtime_backend not in ('cuda', 'rocm'):
+        return resolved
     if not bool(getattr(environment, 'cuda_available', False)):
         return resolved
 
