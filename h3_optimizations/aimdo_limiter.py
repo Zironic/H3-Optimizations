@@ -11,7 +11,7 @@ from .model import get_h3_blocks, is_minimax_h3
 
 PAGE_SIZE = 32 * 1024 * 1024
 CALLBACK_KEY = 'h3_optimizations_aimdo_residency_limiter'
-RESIDENCY_OPTIONS = ('stock', '0 blocks', '1 block', '2 blocks', '4 blocks')
+RESIDENCY_OPTIONS = ('0 blocks', '1 block', '2 blocks', '4 blocks', 'stock')
 DEFAULT_RESIDENCY = '0 blocks'
 RESIDENCY_BLOCKS = {
     '0 blocks': 0,
