@@ -1,0 +1,166 @@
+name: Build experimental AMD Sparse Kitchen
+
+on:
+  push:
+    branches:
+      - experimental/amd-sparse-kitchen
+    paths:
+      - '.github/workflows/build_amd_sparse_kitchen.yml'
+      - 'native/hip/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROCM_VERSION: '7.2.1'
+  H3_HIP_ARCHS: 'gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201'
+
+jobs:
+  linux:
+    name: Linux x86-64
+    runs-on: ubuntu-24.04
+    container: rocm/dev-ubuntu-24.04:7.2.1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends cmake ninja-build binutils
+
+      - name: Build gfx11 and gfx12 library
+        run: |
+          cmake -S native/hip -B native/hip/build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/bin/amdclang++ \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DHIP_PLATFORM=amd \
+            "-DH3_HIP_ARCHS=${H3_HIP_ARCHS}"
+          cmake --build native/hip/build-ci --config Release
+
+      - name: Verify and stage library
+        shell: bash
+        run: |
+          set -euo pipefail
+          library=native/hip/build-ci/libh3_hip_sparse_kitchen.so
+          test -s "$library"
+          for symbol in \
+            h3_hip_sparse_abi_version \
+            h3_hip_sparse_last_error \
+            h3_hip_sparse_route_encoding \
+            h3_hip_sparse_quantize_qk \
+            h3_hip_sparse_quantize_v \
+            h3_hip_sparse_attention
+          do
+            nm -D --defined-only "$library" | grep -q " $symbol$"
+          done
+          mkdir -p native/hip/bin
+          cp "$library" native/hip/bin/libh3_hip_sparse_kitchen.so
+          {
+            echo "source_sha=${GITHUB_SHA}"
+            echo "rocm_version=${ROCM_VERSION}"
+            echo "platform=linux-x86_64"
+            echo "architectures=${H3_HIP_ARCHS}"
+            sha256sum native/hip/bin/libh3_hip_sparse_kitchen.so
+          } > native/hip/bin/BUILD_INFO-linux.txt
+
+      - name: Upload Linux library
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-sparse-kitchen-linux-x86_64
+          path: |
+            native/hip/bin/libh3_hip_sparse_kitchen.so
+            native/hip/bin/BUILD_INFO-linux.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC and Windows SDK
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cmake ninja setuptools wheel
+
+      - name: Install pinned ROCm HIP SDK
+        shell: bash
+        run: |
+          python -m pip install --no-index --no-build-isolation \
+            --find-links "https://repo.radeon.com/rocm/windows/rocm-rel-${ROCM_VERSION}/" \
+            "rocm[libraries,devel]==${ROCM_VERSION}"
+          python -m rocm_sdk path --root
+
+      - name: Build gfx11 and gfx12 library
+        shell: pwsh
+        run: |
+          $rocmRoot = (python -m rocm_sdk path --root).Trim()
+          $compiler = Join-Path $rocmRoot 'lib\llvm\bin\clang++.exe'
+          $resourceCompiler = (Get-Command rc.exe).Source.Replace('\', '/')
+          cmake -S native/hip -B native/hip/build-ci -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_C_COMPILER=$compiler" `
+            "-DCMAKE_CXX_COMPILER=$compiler" `
+            "-DCMAKE_HIP_COMPILER=$compiler" `
+            "-DCMAKE_RC_COMPILER=$resourceCompiler" `
+            "-DCMAKE_PREFIX_PATH=$rocmRoot" `
+            -DHIP_PLATFORM=amd `
+            "-DH3_HIP_ARCHS=$env:H3_HIP_ARCHS"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build native/hip/build-ci --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify and stage library
+        shell: pwsh
+        run: |
+          $library = 'native\hip\build-ci\h3_hip_sparse_kitchen.dll'
+          if (-not (Test-Path -LiteralPath $library)) {
+            throw "Missing $library"
+          }
+          $exports = (& dumpbin.exe /exports $library) -join "`n"
+          @(
+            'h3_hip_sparse_abi_version',
+            'h3_hip_sparse_last_error',
+            'h3_hip_sparse_route_encoding',
+            'h3_hip_sparse_quantize_qk',
+            'h3_hip_sparse_quantize_v',
+            'h3_hip_sparse_attention'
+          ) | ForEach-Object {
+            if ($exports -notmatch [regex]::Escape($_)) {
+              throw "Missing export $_"
+            }
+          }
+          New-Item -ItemType Directory -Force native\hip\bin | Out-Null
+          Copy-Item -LiteralPath $library -Destination native\hip\bin\h3_hip_sparse_kitchen.dll
+          @(
+            "source_sha=$env:GITHUB_SHA",
+            "rocm_version=$env:ROCM_VERSION",
+            'platform=windows-x64',
+            "architectures=$env:H3_HIP_ARCHS",
+            "sha256=$((Get-FileHash native\hip\bin\h3_hip_sparse_kitchen.dll -Algorithm SHA256).Hash.ToLowerInvariant())"
+          ) | Set-Content -Encoding ascii native\hip\bin\BUILD_INFO-windows.txt
+
+      - name: Upload Windows library
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-sparse-kitchen-windows-x64
+          path: |
+            native/hip/bin/h3_hip_sparse_kitchen.dll
+            native/hip/bin/BUILD_INFO-windows.txt
+          if-no-files-found: error
+          retention-days: 30

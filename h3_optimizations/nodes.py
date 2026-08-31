@@ -49,12 +49,16 @@ def _video_budget_input():
 
 
 def _validate_budget(name, value):
+    if value is None:
+        return None
     if not math.isfinite(float(value)):
         return '%s must be finite' % name
     return None
 
 
 def _validate_steps(name, value):
+    if value is None:
+        return None
     if isinstance(value, bool) or int(value) != value or int(value) < 0:
         return '%s must be a non-negative integer' % name
     return None
@@ -307,9 +311,9 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_kv=DEFAULT_EDGE_KV,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
-        if backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
+        if backend is not None and backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
-        if early_schedule not in EARLY_SCHEDULE_OPTIONS:
+        if early_schedule is not None and early_schedule not in EARLY_SCHEDULE_OPTIONS:
             return 'unknown early schedule %r' % early_schedule
         if video_token_order not in VIDEO_TOKEN_ORDER_REQUESTS:
             return 'unknown video token order %r' % video_token_order
