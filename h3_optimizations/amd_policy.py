@@ -4,38 +4,30 @@ from __future__ import annotations
 
 from dataclasses import replace
 import logging
+import threading
 
 import torch
 
 from . import apply as _base
 from . import apply_policy as _policy  # noqa: F401 - installs ordinary policy first
+from .attention.sparse import existing_dense_sparse as _dense_sparse
 from .attention.sparse.existing_dense_sparse import (
     ExistingDenseSparseBackend,
     ExistingDenseSparseError,
-    ExistingDenseSparseQKVProjector,
-    probe_existing_dense_sparse,
+    ExistingDenseSparseSpec,
 )
 from .environment import BACKEND_ROCM
 from .plan import (
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
-    FUSED_QKV_OFF,
     FUSED_QKV_REQUIRED,
     QKV_STREAMING_FORCED,
-    QKV_STREAMING_OFF,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_KITCHEN,
     SPARSE_BACKEND_SAGE,
     SPARSE_BACKEND_TRITON,
 )
-from .qkv import policy as _qkv_policy
-from .qkv.providers import (
-    QKV_BF16_CHUNKED,
-    QKV_FORCE_BF16_CHUNKED,
-    QKV_FORCE_CONVROT_INT8_CHUNKED,
-    QKV_STANDARD,
-    QKVProviderResolution,
-)
+from .qkv.providers import QKV_STANDARD, QKVProviderResolution
 
 
 LOG_PREFIX = '[H3 Optimizations]'
@@ -46,6 +38,8 @@ SELECTED_EXISTING_DENSE_SPARSE = 'rocm_existing_dense_sparse'
 
 _POLICY_RESOLVE_ATTENTION = _base._resolve_attention
 _ORIGINAL_RESOLVE_TRITON_SPARSE = _base._resolve_triton_sparse
+_rdna2_probe_lock = threading.Lock()
+_rdna2_probe_results = {}
 
 
 def _active_rocm_architecture(environment=None):
@@ -95,97 +89,268 @@ def _resolve_triton_sparse(plan, environment, inventory, fallback_reason):
 _base._resolve_triton_sparse = _resolve_triton_sparse
 
 
-def _common_streamable(inventory):
-    return bool(
-        getattr(inventory, 'qkv_plain_float', False)
-        or getattr(inventory, 'qkv_convrot_int8_256', False)
-        or getattr(inventory, 'qkv_w4a8', False)
-        or getattr(inventory, 'qkv_fp8', False)
-    )
-
-
-def _resolve_qkv(plan, inventory):
-    request = _base._qkv_request(plan)
-    memory = getattr(plan, 'memory', None)
-    if request == FUSED_QKV_OFF or (
-        memory is not None and memory.qkv_streaming == QKV_STREAMING_OFF
-    ):
-        return (
-            QKVProviderResolution(
-                QKV_STANDARD,
-                False,
-                'QKV streaming is disabled for the RDNA2 sparse adapter',
-            ),
-            None,
+def _validate_rdna2_qkv(q, k, v):
+    '''The existing-dense adapter is dtype-neutral for H3's BF16/FP32 modes.'''
+    if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
+        raise ExistingDenseSparseError(
+            'existing-dense sparse attention requires equal HND rank-4 Q/K/V'
+        )
+    if q.shape[0] != 1 or q.shape[-1] != _dense_sparse.HEAD_DIM:
+        raise ExistingDenseSparseError(
+            'existing-dense sparse attention requires batch 1 and head_dim 128'
+        )
+    if q.dtype not in (torch.bfloat16, torch.float32):
+        raise ExistingDenseSparseError(
+            'RDNA2 existing-dense sparse attention requires BF16 or FP32 Q/K/V'
+        )
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ExistingDenseSparseError(
+            'existing-dense sparse attention requires matching Q/K/V dtypes'
+        )
+    if q.device != k.device or q.device != v.device or not q.is_cuda:
+        raise ExistingDenseSparseError(
+            'existing-dense sparse attention requires one CUDA/ROCm device'
+        )
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ExistingDenseSparseError(
+            'existing-dense sparse attention requires contiguous head dimensions'
         )
 
-    native_format = _qkv_policy._native_stream_format(inventory)
+
+# The generic adapter was originally BF16-only because it was introduced behind
+# a BF16 streamed projector. RDNA2 now deliberately uses stock Comfy QKV, whose
+# real execution dtype can be FP32 on older ROCm stacks. The packing/router math
+# itself is dtype-neutral for the two H3 inference dtypes.
+_dense_sparse._validate_qkv = _validate_rdna2_qkv
+
+
+def _probe_case_dtype(device, transformer_options, *, q_rows, k_rows, batch, dtype):
+    generator = torch.Generator(device=device).manual_seed(
+        20260831
+        + int(q_rows) * 17
+        + int(k_rows) * 31
+        + int(batch)
+        + (1 if dtype == torch.float32 else 0)
+    )
+    q = torch.randn(
+        (int(batch), 1, int(q_rows), _dense_sparse.HEAD_DIM),
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    k = torch.randn(
+        (int(batch), 1, int(k_rows), _dense_sparse.HEAD_DIM),
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    v = torch.randn(
+        (int(batch), 1, int(k_rows), _dense_sparse.HEAD_DIM),
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    actual = _dense_sparse._call_existing_dense(
+        q,
+        k,
+        v,
+        transformer_options,
+        heads=1,
+    )
+    if tuple(actual.shape) != tuple(q.shape):
+        raise ExistingDenseSparseError(
+            'existing attention returned %s for %s probe input %s'
+            % (tuple(actual.shape), dtype, tuple(q.shape))
+        )
+    expected = _dense_sparse._reference_attention(q, k, v)
+    torch.cuda.synchronize(device)
+    finite = bool(torch.isfinite(actual).all())
+    rel_l2 = _dense_sparse._relative_l2(actual, expected)
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    if not (
+        finite
+        and rel_l2 < _dense_sparse._PROBE_REL_L2
+        and max_abs < _dense_sparse._PROBE_MAX_ABS
+    ):
+        raise ExistingDenseSparseError(
+            'existing attention %s probe numerics failed: finite=%s rel_l2=%.6f '
+            'max_abs=%.6f' % (dtype, finite, rel_l2, max_abs)
+        )
+
+
+def _probe_geometry_dtype(device, transformer_options, q_tile, kv_tile, dtype):
+    for k_rows in (kv_tile, kv_tile * 2, kv_tile * 2 - 7):
+        _probe_case_dtype(
+            device,
+            transformer_options,
+            q_rows=q_tile,
+            k_rows=k_rows,
+            batch=1,
+            dtype=dtype,
+        )
+    for batch in (16, 8, 4, 2):
+        try:
+            _probe_case_dtype(
+                device,
+                transformer_options,
+                q_rows=q_tile,
+                k_rows=kv_tile * 2 - 7,
+                batch=batch,
+                dtype=dtype,
+            )
+            return batch
+        except Exception:
+            continue
+    return 1
+
+
+def probe_rdna2_existing_dense_sparse(
+    transformer_options=None,
+    device=None,
+    *,
+    dtype,
+    force=False,
+):
+    '''Probe the same dtype that stock H3 QKV actually produced at runtime.'''
+    if dtype not in (torch.bfloat16, torch.float32):
+        raise ExistingDenseSparseError(
+            'RDNA2 sparse-over-dense cannot probe unsupported QKV dtype %s' % dtype
+        )
+    device = torch.device('cuda' if device is None else device)
+    options = _dense_sparse._probe_options(transformer_options)
+    key = _dense_sparse._probe_key(device, options) + (str(dtype),)
+    with _rdna2_probe_lock:
+        if not force and key in _rdna2_probe_results:
+            result = _rdna2_probe_results[key]
+            if isinstance(result, Exception):
+                raise ExistingDenseSparseError(str(result))
+            return result
+
+        failures = []
+        for q_tile, kv_tile in ((64, 64), (128, 128)):
+            try:
+                max_batch = _probe_geometry_dtype(
+                    device,
+                    options,
+                    q_tile,
+                    kv_tile,
+                    dtype,
+                )
+                spec = ExistingDenseSparseSpec(q_tile, kv_tile, max_batch)
+                _rdna2_probe_results[key] = spec
+                logging.info(
+                    '%s RDNA2 existing-dense sparse probe selected %dQ x %dKV '
+                    'for %s (packed batch <= %d)',
+                    LOG_PREFIX,
+                    q_tile,
+                    kv_tile,
+                    str(dtype).replace('torch.', ''),
+                    max_batch,
+                )
+                return spec
+            except Exception as error:
+                failures.append(
+                    '%dQ x %dKV: %s: %s'
+                    % (q_tile, kv_tile, type(error).__name__, error)
+                )
+
+        error = ExistingDenseSparseError(
+            'the existing Comfy attention rejected both %s sparse adapter '
+            'geometries (%s)' % (dtype, '; '.join(failures))
+        )
+        _rdna2_probe_results[key] = error
+        raise error
+
+
+class RDNA2ExistingDenseSparseBackend(ExistingDenseSparseBackend):
+    '''Existing-dense sparse with runtime dtype/geometry negotiation.'''
+
+    def __init__(self, config=None):
+        # Placeholder geometry only satisfies the generic installation contract.
+        # The first real QKV invocation replaces it after probing that dtype.
+        super().__init__(config, spec=ExistingDenseSparseSpec(64, 64, 1))
+        self._runtime_spec_lock = threading.Lock()
+        self._runtime_dtype = None
+
+    def _activate_spec(self, dtype, spec):
+        with self._runtime_spec_lock:
+            if self._runtime_dtype == dtype and self.spec.signature == spec.signature:
+                return
+            self.spec = spec
+            self.router = _dense_sparse.SparseTileRouter(
+                self.config,
+                q_tile=spec.q_tile,
+                kv_tile=spec.kv_tile,
+            )
+            self._runtime_dtype = dtype
+
+    def prepare(self, q, k, v, *, layer_index, transformer_options):
+        options = transformer_options or {}
+        try:
+            _validate_rdna2_qkv(q, k, v)
+            spec = probe_rdna2_existing_dense_sparse(
+                options,
+                device=q.device,
+                dtype=q.dtype,
+            )
+            self._activate_spec(q.dtype, spec)
+        except Exception as error:
+            return _dense_sparse.PreparedExistingDenseSparse(
+                q=q,
+                k=k,
+                v=v,
+                lut=None,
+                valid=None,
+                metadata={
+                    'layer': int(layer_index),
+                    'sparse_backend': self.name,
+                    'fallback': 'existing_dense',
+                },
+                transformer_options=options,
+                fallback_reason=_dense_sparse._fallback_reason(
+                    'runtime dtype/geometry probe',
+                    error,
+                ),
+            )
+        return super().prepare(
+            q,
+            k,
+            v,
+            layer_index=layer_index,
+            transformer_options=options,
+        )
+
+    def as_status(self):
+        status = super().as_status()
+        status['runtime_qkv_dtype'] = (
+            None if self._runtime_dtype is None else str(self._runtime_dtype)
+        )
+        status['probe_mode'] = 'runtime_actual_qkv_dtype'
+        return status
+
+
+def _resolve_qkv(plan):
+    '''RDNA2 Auto keeps QKV on the exact stock Comfy execution path.'''
+    request = _base._qkv_request(plan)
+    memory = getattr(plan, 'memory', None)
     required = request == FUSED_QKV_REQUIRED or (
         memory is not None and memory.qkv_streaming == QKV_STREAMING_FORCED
     )
-
-    if request == FUSED_QKV_FORCE_BF16:
-        can_stream = _common_streamable(inventory)
-        projection_mode = _base.PROJECTION_FORCE_BF16
-        provider = QKV_FORCE_BF16_CHUNKED
-        projection_label = 'forced BF16'
-    elif request == FUSED_QKV_FORCE_QUANT and getattr(
-        inventory, 'qkv_plain_float', False
-    ):
-        can_stream = True
-        projection_mode = _base.PROJECTION_FORCE_INT8
-        provider = QKV_FORCE_CONVROT_INT8_CHUNKED
-        projection_label = 'runtime ConvRot-256 INT8'
-    else:
-        can_stream = native_format is not None
-        projection_mode = _base.PROJECTION_NATIVE
-        provider = QKV_BF16_CHUNKED
-        projection_label = (
-            'checkpoint-native %s' % native_format
-            if native_format is not None
-            else 'checkpoint-native'
+    if required or request in (FUSED_QKV_FORCE_BF16, FUSED_QKV_FORCE_QUANT):
+        raise ExistingDenseSparseError(
+            'RDNA2 sparse-over-dense does not override explicitly forced QKV '
+            'execution; use Auto/Off QKV streaming or let attention fall back dense'
         )
-
-    if not can_stream:
-        if required:
-            raise ExistingDenseSparseError(
-                'required QKV streaming has no held binding for the checkpoint '
-                'QKV format on the RDNA2 sparse adapter'
-            )
-        return (
-            QKVProviderResolution(
-                QKV_STANDARD,
-                False,
-                'RDNA2 sparse adapter leaves unsupported QKV storage on the '
-                'standard H3 projection path',
-            ),
-            None,
-        )
-
-    chunk_rows = (
-        4096
-        if memory is None
-        else _base._effective_qkv_chunk_rows(memory.chunk_rows)
-    )
-    projector = ExistingDenseSparseQKVProjector(
-        required=required,
-        chunk_rows=chunk_rows,
-        projection_mode=projection_mode,
-    )
     return (
         QKVProviderResolution(
-            provider,
-            True,
-            '%s QKV retains global BF16 K/V and streams bounded BF16 Q into '
-            'the RDNA2 existing-dense sparse adapter' % projection_label,
+            QKV_STANDARD,
+            False,
+            'RDNA2 sparse-over-dense preserves stock Comfy QKV projection so '
+            'quantized checkpoints may dequantize/materialize in the execution '
+            'dtype supported by the installed ROCm/PyTorch stack',
         ),
-        projector,
+        None,
     )
-
-
-def _fallback_device(environment):
-    index = getattr(environment, 'device_index', None)
-    return torch.device('cuda' if index is None else 'cuda:%d' % int(index))
 
 
 def _preserves_external_override(plan, model):
@@ -210,6 +375,7 @@ def _resolve_existing_dense_adapter(
     qkv,
     fallback_reason,
 ):
+    del model, inventory, environment
     if attention.selected != _base.ATTENTION_EXISTING:
         return (
             replace(
@@ -219,25 +385,18 @@ def _resolve_existing_dense_adapter(
             qkv,
         )
 
-    transformer_options = (
-        getattr(model, 'model_options', {}).get('transformer_options', {}) or {}
-    )
     try:
-        spec = probe_existing_dense_sparse(
-            transformer_options,
-            device=_fallback_device(environment),
-        )
-        resolved_qkv, projector = _resolve_qkv(plan, inventory)
+        resolved_qkv, projector = _resolve_qkv(plan)
         config = _base.HybridSparseConfig(
             mode=_base.MODE_SAGE128,
             **_base._sparse_config_kwargs(plan),
         )
-        backend = ExistingDenseSparseBackend(config, spec=spec)
+        backend = RDNA2ExistingDenseSparseBackend(config)
         reason = (
-            '%s; RDNA2 fallback uses the existing ComfyUI dense attention '
-            'consumer over packed %dQ x %dKV routes; runtime adapter failures '
-            'fail open to that same full dense consumer'
-            % (fallback_reason, spec.q_tile, spec.kv_tile)
+            '%s; RDNA2 fallback preserves stock Comfy QKV and probes the '
+            'existing dense attention consumer at runtime using the actual QKV '
+            'dtype, selecting 64Q x 64KV or 128Q x 128KV; adapter failures fail '
+            'open to the same full dense consumer' % fallback_reason
         )
         resolved = _base.ResolvedAttention(
             requested=attention.requested,
@@ -358,6 +517,8 @@ _base._resolve_attention = resolve_attention
 
 __all__ = [
     'RDNA2_ARCHES',
+    'RDNA2ExistingDenseSparseBackend',
     'SELECTED_EXISTING_DENSE_SPARSE',
+    'probe_rdna2_existing_dense_sparse',
     'resolve_attention',
 ]
