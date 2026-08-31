@@ -174,6 +174,7 @@ def test_node_schema_and_request():
         'standard node carries the simple denser-step policy',
     )
 
+
 def test_advanced_node_schema_and_request():
     print('H3 Sparse Attention Advanced node policy')
     schema = H3SparseAttentionAdvanced.define_schema()
@@ -206,16 +207,42 @@ def test_advanced_node_schema_and_request():
         ],
         'advanced backend selector exposes the supported sparse backends',
     )
+    early_kv = input_by_id(schema, 'early_kv').default
     check(
         input_by_id(schema, 'video_budget').default == 0.15
-        and input_by_id(schema, 'early_steps').default == 4
-        and input_by_id(schema, 'early_kv').default == 0.5
+        and input_by_id(schema, 'early_steps').default == 8
+        and abs(early_kv - 41.0 / 60.0) < 1e-12
         and input_by_id(schema, 'late_steps').default == 0
         and input_by_id(schema, 'late_kv').default == 0.5
-        and input_by_id(schema, 'early_schedule').default == 'Hold'
+        and input_by_id(schema, 'early_schedule').default == 'Ramp'
         and input_by_id(schema, 'early_schedule').options == ['Hold', 'Ramp']
         and input_by_id(schema, 'video_token_order').default == '1x8x8',
-        'advanced early and late defaults match the public contract',
+        'advanced defaults use the compute-matched eight-step early ramp',
+    )
+    default_ramp = HybridSparseConfig(
+        video_budget=0.15,
+        early_steps=8,
+        early_kv=early_kv,
+        late_steps=0,
+        late_kv=0.5,
+        early_schedule='Ramp',
+    )
+    simple_default = HybridSparseConfig(
+        video_budget=0.15,
+        denser_early_late_steps=True,
+    )
+    advanced_area = sum(
+        resolve_video_budget(default_ramp, step, 20) - 0.15
+        for step in range(20)
+    )
+    simple_area = sum(
+        resolve_video_budget(simple_default, step, 20) - 0.15
+        for step in range(20)
+    )
+    check(
+        abs(advanced_area - simple_area) < 1e-12
+        and abs(advanced_area - 2.4) < 1e-12,
+        'advanced defaults match the simple default 20-step compute budget',
     )
 
     model = SimpleNamespace(model_options={})
