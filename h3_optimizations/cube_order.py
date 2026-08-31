@@ -2,6 +2,7 @@
 
 from copy import copy
 from functools import lru_cache
+import inspect
 import logging
 
 import torch
@@ -28,6 +29,7 @@ TOKEN_ORDER_SHAPES = {
     VIDEO_TOKEN_ORDER_4X4X4: (4, 4, 4),
     VIDEO_TOKEN_ORDER_RASTER: None,
 }
+_PACKED_LAYOUT_PARAMETERS = inspect.signature(PackedLayout).parameters
 
 
 class H3CubeOrderPatchError(RuntimeError):
@@ -179,11 +181,17 @@ def _layout(payload, context, padded_video, audio):
     )
     layout = payload.get("layout")
     if not _matching_layout(layout, signature):
-        layout = PackedLayout(
-            *signature,
-            keyframes=payload.get("keyframes"),
-            refs=payload.get("refs"),
-        )
+        kwargs = {
+            "keyframes": payload.get("keyframes"),
+            "refs": payload.get("refs"),
+        }
+        # ComfyUI v0.33 requires frame_count to resolve a last-frame FL2VA
+        # anchor. v0.34 removed that constructor parameter when it generalized
+        # PackedLayout to arbitrary keyframe positions, so only forward metadata
+        # that the installed Comfy constructor actually accepts.
+        if "frame_count" in _PACKED_LAYOUT_PARAMETERS:
+            kwargs["frame_count"] = payload.get("frame_count")
+        layout = PackedLayout(*signature, **kwargs)
     return layout
 
 
