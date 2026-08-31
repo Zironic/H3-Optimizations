@@ -9,6 +9,7 @@ import torch
 
 from . import apply as _base
 from . import apply_policy as _policy  # noqa: F401 - installs ordinary policy first
+from .attention.sparse import existing_dense_sparse as _dense_sparse
 from .attention.sparse.existing_dense_sparse import (
     ExistingDenseSparseBackend,
     ExistingDenseSparseError,
@@ -43,6 +44,8 @@ SELECTED_EXISTING_DENSE_SPARSE = 'rocm_existing_dense_sparse'
 
 _POLICY_RESOLVE_ATTENTION = _base._resolve_attention
 _ORIGINAL_TRITON_PREFLIGHT = _base.preflight_triton_sparse
+_ORIGINAL_PACKED_EXECUTE = _dense_sparse._execute_packed_sparse
+_packed_runtime_fallback_warned = False
 
 
 def _active_rocm_architecture(environment=None):
@@ -84,6 +87,49 @@ def preflight_triton_sparse(*args, **kwargs):
 # it here skips the compile-failing RDNA2 probe while leaving every other device
 # on the original implementation.
 _base.preflight_triton_sparse = preflight_triton_sparse
+
+
+def _safe_execute_packed_sparse(
+    q,
+    k,
+    v,
+    selected_tiles,
+    transformer_options,
+    *,
+    spec,
+):
+    '''Fail an unanticipated packed-shape rejection open to full dense attention.'''
+    global _packed_runtime_fallback_warned
+    try:
+        return _ORIGINAL_PACKED_EXECUTE(
+            q,
+            k,
+            v,
+            selected_tiles,
+            transformer_options,
+            spec=spec,
+        )
+    except Exception as error:
+        if not _packed_runtime_fallback_warned:
+            _packed_runtime_fallback_warned = True
+            logging.warning(
+                '%s RDNA2 packed sparse call failed at runtime; using full '
+                'existing dense attention for the affected Q slab: %s: %s',
+                LOG_PREFIX,
+                type(error).__name__,
+                error,
+            )
+        return _dense_sparse._call_existing_dense(
+            q,
+            k,
+            v,
+            transformer_options,
+            heads=int(q.shape[1]),
+        )
+
+
+_safe_execute_packed_sparse._h3_rdna2_dense_fallback = True
+_dense_sparse._execute_packed_sparse = _safe_execute_packed_sparse
 
 
 def _common_streamable(inventory):
