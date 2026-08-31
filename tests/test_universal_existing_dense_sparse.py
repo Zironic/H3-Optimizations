@@ -35,6 +35,18 @@ from h3_optimizations.plan import (  # noqa: E402
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
+class TensorProxy:
+    def __init__(self, dtype):
+        self.shape = (1, 1, 8, 128)
+        self.dtype = dtype
+        self.device = torch.device('cuda')
+        self.is_cuda = True
+
+    def stride(self, dim=None):
+        strides = (1024, 1024, 128, 1)
+        return strides if dim is None else strides[dim]
+
+
 class UniversalExistingDenseSparsePolicyTests(unittest.TestCase):
     def setUp(self):
         universal._probe_results.clear()
@@ -152,14 +164,8 @@ class UniversalExistingDenseSparsePolicyTests(unittest.TestCase):
     def test_runtime_qkv_validator_accepts_h3_float_dtypes(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):
-                q = torch.empty((1, 1, 8, 128), dtype=dtype)
-                with mock.patch.object(
-                    torch.Tensor,
-                    'is_cuda',
-                    new_callable=mock.PropertyMock,
-                    return_value=True,
-                ):
-                    universal._validate_qkv(q, q, q)
+                q = TensorProxy(dtype)
+                universal._validate_qkv(q, q, q)
 
     def test_probe_cache_is_separate_per_runtime_dtype(self):
         observed = []
