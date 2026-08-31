@@ -28,6 +28,10 @@ LAZY_CONSUMER_TESTS = {
         'test_streamed_kitchen_output.py',
         'test_dense_kitchen_streamed_q_keeps_lazy_input_separate_from_output',
     ),
+    'attention/sparse/existing_dense_sparse.py': (
+        'test_rocm_existing_dense_failopen.py',
+        'test_streamed_existing_dense_keeps_lazy_input_separate_from_output',
+    ),
     'attention/sparse/frost_bf16_streamed.py': (
         'test_streamed_frost_bf16.py',
         'test_execute_keeps_lazy_input_separate_from_attention_output',

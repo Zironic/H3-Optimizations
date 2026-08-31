@@ -5,6 +5,15 @@ Production optimization nodes for MiniMax H3 in ComfyUI.
 The pack focuses on two things: reducing the amount of VRAM H3 needs and making
 longer H3 generations faster with optional sparse attention.
 
+> **Experimental AMD branch:** On ROCm gfx11/gfx12 GPUs, the normal H3 Sparse
+> Attention node tries the shipped AMD Sparse Kitchen INT8 backend first. On
+> RDNA 2 gfx103x it skips sparse backends that require unavailable matrix/kernel
+> support, then tries ROCm FlexAttention when usable and finally a probed
+> sparse-over-existing-dense adapter. Adapter failures fail open to the same full
+> dense ComfyUI attention consumer. This path is intended for hardware testing;
+> the shipped gfx11/gfx12 native libraries have not yet passed a live AMD run.
+> See [Experimental AMD Sparse Kitchen](#experimental-amd-sparse-kitchen).
+
 # How does it affect quality?
 
 You can see my test videos here 
@@ -93,7 +102,7 @@ benchmarking, or deliberately forcing a particular execution policy.
 ## H3 AIMDO Residency Limiter
 
 **Use this when you specifically want to control how much H3 model weight
-DynamicVRAM keeps resident on the GPU.**
+DynamicVRAM keeps persistently resident on the GPU.**
 
 This node exists mainly for benchmarking, debugging AIMDO behavior, and forcing
 minimal persistent H3 model residency. It is not intended to imply that one
@@ -357,10 +366,13 @@ enabled and requires asynchronous weight offloading for numeric limits.
 
 ## Sparse routing and backends
 
-The standard H3 Sparse Attention node uses automatic backend selection. It
-prefers the shipped native Kitchen sparse backend when its per-GPU self-test
-passes, then tries compatible Sparse Sage, BF16 Triton, FlexAttention, and
-finally the resolved dense H3 path.
+The standard H3 Sparse Attention node uses automatic backend selection. On
+NVIDIA it prefers the shipped native Kitchen sparse backend when its per-GPU
+self-test passes, then tries compatible Sparse Sage, BF16 Triton, FlexAttention,
+and finally the resolved dense H3 path. On RDNA2 gfx103x, Auto skips Kitchen
+INT8, Sparse Sage, and BF16 Triton because those paths are known incompatible;
+it tries ROCm FlexAttention when available, then the probed sparse-over-existing-
+dense adapter, and finally ordinary dense attention.
 
 A `1.0` video budget leaves the video route fully connected but still enters this
 backend-selection path. Bypass H3 Sparse Attention when comparing against the
@@ -389,6 +401,53 @@ The shipped CUDA targets are SM75, SM80, SM89, and SM120 on Windows, with SM90a
 also included on Linux. Each target ships real SASS and one SM89 PTX fallback is
 retained for forward compatibility.
 
+### Experimental AMD Sparse Kitchen
+
+This branch adapts the exact INT8 stage from Comfy Kitchen's HIP Sol-Attn work
+to H3's existing 64Q x 64KV sparse route. H3 still chooses every KV block; the
+Sol router, approximate tail, and fused QKV producer are not used. Supported
+native targets are gfx11 (RDNA 3/3.5) and gfx12 (RDNA 4).
+
+RDNA 2 gfx103x does not enter the native Kitchen path and does not try BF16
+Triton: the latter requires BF16 matrix multiply that RDNA2 does not provide.
+Sparse Sage is likewise skipped because it is an NVIDIA CUDA extension. RDNA2
+Auto therefore tries ROCm FlexAttention when the installed stack can lower it;
+otherwise it probes the existing ComfyUI dense attention consumer for 64Q x
+64KV and then 128Q x 128KV packed sparse execution. If the adapter later meets
+an unprobed route, shape, batch, or consumer restriction, it fails open to full
+dense attention for the affected invocation or streamed Q chunk.
+
+Credit to Deluxa for the RDNA3+ Sol exact HIP kernel adapted by this branch.
+
+The branch ships prebuilt Linux x86-64 and Windows x64 libraries in
+`native/hip/bin`, compiled with ROCm 7.2.1 for the supported gfx11/gfx12 targets. Testers do
+not need CMake, a compiler, or the ROCm development SDK; they need only their
+normal ROCm ComfyUI runtime and a supported GPU.
+
+The loader searches `native/hip/bin`, `native/hip/lib`, `native/hip/build`, and
+`native/hip/build/Release`. If the build emits the library elsewhere, place its
+absolute path in the ignored `native/hip/library_path.txt` file.
+
+Automatic sparse selection on gfx11/gfx12 AMD hardware tries AMD Sparse Kitchen
+before the ordinary sparse fallback chain. The first resolution runs cached,
+per-device full-route and genuinely sparse numerical comparisons against
+PyTorch attention. These checks use a non-64-divisible sequence, production-
+shaped strided HND inputs, NHD output, varying per-head/query-block routes, and
+delta route conversion. A missing library, unsupported architecture, or failed
+self-test retires AMD Sparse Kitchen and leaves the existing automatic fallback
+behavior in control. Explicitly selecting `Kitchen INT8` remains a hard
+requirement and reports the failure instead.
+
+RDNA2 uses a different fail-open adapter path and is not evidence for the native
+HIP kernel. The adapter's architecture-neutral routing, packing, probe, and
+fallback contracts can be exercised on CUDA, but only live gfx103x hardware can
+validate the actual ROCm dense consumer and runtime behavior.
+
+This is an experimental tester branch. The shipped gfx11/gfx12 libraries have
+been compiled and ABI-export checked in CI on Ubuntu 24.04 and Windows Server
+2022, but have not been executed on AMD hardware. A live gfx11 or gfx12 run is
+still required to establish numerical correctness and performance.
+
 ### FROST BF16
 
 FROST BF16 is an explicit SM89-only 64Q x 64KV backend. It uses the packaged
@@ -411,7 +470,8 @@ The package BF16 Triton backend is available on supported Triton runtimes and
 uses the same 64Q x 64KV routing geometry as the native Kitchen default. It can
 stream projection chunks from supported BF16, ConvRot-256, W4A8, and FP8
 checkpoints into its BF16 attention carrier without retaining a full fused
-projection temporary.
+projection temporary. RDNA2 gfx103x is explicitly excluded because it lacks the
+BF16 matrix multiply required by this backend.
 
 ### FlexAttention
 
@@ -486,7 +546,12 @@ overrides retain full-Q single-call behavior.
 - Any backend supported by ComfyUI's MiniMax H3 implementation for the final
   dense fallback
 - NVIDIA SM75 or newer for the shipped native Kitchen default
-- NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback
+- AMD gfx11 (RDNA 3/3.5) or gfx12 (RDNA 4) and a compatible ROCm PyTorch runtime for
+  the shipped experimental AMD Sparse Kitchen library
+- NVIDIA SM80 or newer with Triton for the BF16 Triton sparse fallback; RDNA2
+  gfx103x is explicitly unsupported by that backend
+- A ROCm-capable PyTorch build with a working existing H3 dense attention
+  consumer for the RDNA2 sparse-over-dense adapter
 - An FP8-capable NVIDIA GPU with PyTorch FlexAttention for the NVIDIA Flex path
 - A ROCm-capable PyTorch build with FlexAttention/Triton for the AMD sparse Flex
   path
@@ -510,10 +575,15 @@ composition, backend classification, streamed and chunked projection contracts,
 FROST ABI behavior, native shipping contracts, explicit sparse-backend
 selection, chunk boundaries and RoPE slices, non-H3 no-op behavior, sparse route
 geometry, runtime step/layout publication, early/middle/late density schedules,
-and source isolation.
+and source isolation. RDNA2 CPU contracts additionally verify that known-dead
+Auto backends are skipped and that adapter preparation/execution failures fail
+open to the existing dense consumer.
 
 GPU kernel validation is intentionally separate because it requires matching
-hardware and compiled backend packages.
+hardware and compiled backend packages. A CUDA contract test also exercises the
+architecture-neutral RDNA2 adapter with an unknown dense consumer that passes the
+probe and later rejects an unprobed packed shape; this validates fail-open control
+flow on real GPU tensors but does not validate ROCm execution.
 
 Live SM89 gates compare whole-carrier and streamed Kitchen Q/Q-scale exactly,
 exercise every shipped Kitchen geometry, and check the declared SM89

@@ -50,7 +50,7 @@ from .dense_resolver import (
     resolve_current_dense_attention,
     resolve_dense_attention,
 )
-from .environment import RuntimeEnvironment
+from .environment import BACKEND_ROCM, RuntimeEnvironment
 from .kitchen_qkv import (
     PRODUCER_ABI as KITCHEN_PRODUCER_ABI,
     ChunkedKitchenAttentionBackend,
@@ -722,6 +722,7 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
     kitchen = preflight_sparse_kitchen(
         cuda_available=lambda: environment.cuda_available,
         capability_getter=lambda: environment.capability,
+        backend=getattr(environment, 'backend', None),
         q_tile=KITCHEN_Q_TILE,
         kv_tile=KITCHEN_KV_TILE,
     )
@@ -729,8 +730,12 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
         inventory,
         request=_qkv_request(plan),
         backend_kind=ATTENTION_KITCHEN_SPARSE,
-        kitchen_producer_available=producer_api_available(
-            device=getattr(environment, 'device_index', None),
+        kitchen_producer_available=(
+            False
+            if getattr(environment, 'backend', None) == BACKEND_ROCM
+            else producer_api_available(
+                device=getattr(environment, 'device_index', None),
+            )
         ),
         memory_optimize=plan.memory is not None,
         fp8_available=_fp8_execution_available(environment),
@@ -786,7 +791,11 @@ def _resolve_kitchen_sparse(plan, environment, inventory):
             requested=ATTENTION_KITCHEN_SPARSE,
             selected=ATTENTION_KITCHEN_SPARSE,
             backend=backend,
-            reason='native Kitchen INT8 64Q x 64KV sparse attention',
+            reason=(
+                'experimental AMD Kitchen INT8 64Q x 64KV sparse attention'
+                if getattr(environment, 'backend', None) == BACKEND_ROCM
+                else 'native Kitchen INT8 64Q x 64KV sparse attention'
+            ),
             backend_kind=ATTENTION_KITCHEN_SPARSE,
             projector=projector,
         ),

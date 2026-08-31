@@ -1,0 +1,22 @@
+Comfy-Org/comfy-kitchen pull requests 139 and 143
+Sol-Attn source commit: d9630b8c6524c791671138520c84afa358ef08b3
+Base HIP source commit: f8ef6fc5958b0f6475927526d3c1b9f9d84184d1
+License: Apache-2.0
+
+Vendored files:
+- comfy_kitchen/backends/hip/mma.h
+- comfy_kitchen/backends/hip/fp8_utils.h
+- comfy_kitchen/backends/hip/sage_attention/sol_attn_exact.hip
+- comfy_kitchen/backends/hip/sage_attention/sol_attn_preprocess.hip
+- comfy_kitchen/backends/hip/sage_attention/sol_attn_vtranspose.hip
+- comfy_kitchen/backends/hip/sage_attention/sol_common.h
+- comfy_kitchen/backends/hip/sage_attention/sage_common.h
+
+H3 changes:
+- Sol routing and the approximate tail are omitted; H3 supplies an absolute
+  64KV-tile route per 64-query block.
+- A post-projection carrier adapter produces per-row Q/K scales, centered K,
+  transposed V, and per-channel V scales without reapplying Norm1 or RoPE.
+- The exact stage starts with an empty online-softmax state and supports gfx11
+  and gfx12 through Kitchen's MmaInt8 policy.
+- A plain C ABI replaces Kitchen's nanobind boundary.

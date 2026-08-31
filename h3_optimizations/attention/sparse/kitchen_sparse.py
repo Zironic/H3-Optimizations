@@ -57,7 +57,12 @@ def _kitchen():
     backend is unavailable for everyone -- the same way the chunked QKV
     producer was integrated here for months without running once.
     """
-    from ...native import int8_attention as vendored
+    import torch
+
+    if getattr(torch.version, 'hip', None):
+        from ...native import hip_int8_attention as vendored
+    else:
+        from ...native import int8_attention as vendored
 
     if vendored.int8_attention_is_available():
         return vendored
@@ -79,25 +84,43 @@ def _kitchen():
 
 
 def preflight_sparse_kitchen(
-    *, cuda_available, capability_getter, kitchen=None, q_tile=None, kv_tile=None
+    *, cuda_available, capability_getter, backend=None, kitchen=None,
+    q_tile=None, kv_tile=None
 ):
     '''Resolve the Kitchen sparse kernel, or say exactly why it is unavailable.'''
-    if not cuda_available():
-        raise SparseKitchenError('Kitchen sparse attention requires CUDA')
     module = _kitchen() if kitchen is None else kitchen
-    capability = capability_getter()
-    if capability is None:
-        raise SparseKitchenError('Kitchen sparse GPU capability is unavailable')
-    capability = tuple(int(value) for value in capability)
-    if len(capability) != 2 or capability < (7, 5):
-        raise SparseKitchenError(
-            'Kitchen sparse attention requires NVIDIA compute capability 7.5 '
-            'or newer; found %d.%d' % capability
-        )
-    if not module.int8_attention_is_available():
-        raise SparseKitchenError(
-            'the comfy-kitchen CUDA extension is not available on this device'
-        )
+    is_hip = getattr(module, 'IS_HIP_SPARSE_KITCHEN', False) is True
+    if is_hip:
+        if backend not in (None, 'rocm'):
+            raise SparseKitchenError('AMD Sparse Kitchen requires ROCm')
+        architecture = module.device_architecture()
+        supported = getattr(module, 'SUPPORTED_ARCHITECTURES', ('gfx1200', 'gfx1201'))
+        if architecture not in supported:
+            raise SparseKitchenError(
+                'AMD Sparse Kitchen requires a supported gfx11 or gfx12 GPU; found %s'
+                % (architecture or 'unknown')
+            )
+        if not module.int8_attention_is_available():
+            raise SparseKitchenError(
+                'the experimental AMD Sparse Kitchen library or its numerical '
+                'self-test is unavailable'
+            )
+    elif not cuda_available():
+        raise SparseKitchenError('Kitchen sparse attention requires CUDA')
+    else:
+        capability = capability_getter()
+        if capability is None:
+            raise SparseKitchenError('Kitchen sparse GPU capability is unavailable')
+        capability = tuple(int(value) for value in capability)
+        if len(capability) != 2 or capability < (7, 5):
+            raise SparseKitchenError(
+                'Kitchen sparse attention requires NVIDIA compute capability 7.5 '
+                'or newer; found %d.%d' % capability
+            )
+        if not module.int8_attention_is_available():
+            raise SparseKitchenError(
+                'the comfy-kitchen CUDA extension is not available on this device'
+            )
     if q_tile is not None or kv_tile is not None:
         geometry = (
             Q_TILE if q_tile is None else int(q_tile),
@@ -240,9 +263,13 @@ class SparseKitchenExecutor:
             raise SparseKitchenError(
                 'Kitchen sparse attention received invalid Q/K carriers'
             )
-        if quantized.q.shape != quantized.k.shape:
+        if (
+            quantized.q.shape[0] != quantized.k.shape[0]
+            or quantized.q.shape[1] != quantized.k.shape[1]
+            or quantized.q.shape[-1] != quantized.k.shape[-1]
+        ):
             raise SparseKitchenError(
-                'Kitchen sparse attention requires equal Q/K carrier shapes'
+                'Kitchen sparse attention requires compatible Q/K carrier shapes'
             )
         if int(quantized.original_head_dim) != HEAD_DIM:
             raise SparseKitchenError(
@@ -559,7 +586,11 @@ class SparseKitchenBackend:
             'sparse_q_tile': int(self.executor.q_tile),
             'sparse_kv_tile': int(self.executor.kv_tile),
             'sparse_v_format': 'int8',
-            'route_encoding': 'delta',
+            'route_encoding': getattr(
+                self.executor.kitchen,
+                'KERNEL_ROUTE_ENCODING',
+                'delta',
+            ),
             'output_layout': self.output_layout,
             'score_chunk_tiles': getattr(
                 self.router, 'score_chunk_tiles', None
