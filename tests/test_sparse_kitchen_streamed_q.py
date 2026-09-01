@@ -56,6 +56,55 @@ class _Layout:
 
 
 class StreamedSparseKitchenRoutingTests(unittest.TestCase):
+    def test_short_video_route_plan_stays_dense(self):
+        class NoSelectionRouter(SparseTileRouter):
+            def _select_indices(self, *_args, **_kwargs):
+                raise AssertionError('dense boundary must not run Top-K')
+
+        video_start = 5263
+        cases = (
+            (64, 64, 5312),
+            (64, 128, 5312),
+            (64, 128, 5313),
+            (128, 64, 5313),
+        )
+        for q_tile, kv_tile, sequence in cases:
+            with self.subTest(
+                q_tile=q_tile,
+                kv_tile=kv_tile,
+                sequence=sequence,
+            ):
+                router = NoSelectionRouter(q_tile=q_tile, kv_tile=kv_tile)
+                current_layout = _Layout(sequence, video_start)
+                geometry = router.geometry(current_layout)
+                k_summary = torch.zeros(1, 2, geometry.kv_tiles, 4)
+                plan, metadata = _prepare_route_plan(
+                    router,
+                    k_summary,
+                    current_layout,
+                    0.15,
+                )
+                lut, counts = _build_route_chunk(
+                    router,
+                    plan,
+                    torch.zeros(1, 2, geometry.q_tiles, 4),
+                    tile_start=0,
+                )
+
+                self.assertTrue(torch.all(counts == geometry.kv_tiles))
+                self.assertTrue(
+                    torch.equal(
+                        torch.cumsum(lut, dim=-1, dtype=torch.int32),
+                        torch.arange(geometry.kv_tiles, dtype=torch.int32)
+                        .view(1, 1, 1, -1)
+                        .expand_as(lut),
+                    )
+                )
+                self.assertEqual(metadata.actual_video_tile_density, 1.0)
+                self.assertEqual(metadata.full_mask_density, 1.0)
+                self.assertEqual(metadata.sparse_q_tiles, 0)
+                self.assertEqual(metadata.dense_q_tiles, geometry.q_tiles)
+
     def test_exact_fused_q_eligibility_receives_a_tensor_from_lazy_norm(self):
         class StopAfterEligibility(Exception):
             pass

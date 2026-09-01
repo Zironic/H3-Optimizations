@@ -51,6 +51,10 @@ class SparseTileGeometry:
     def pure_video_kv_tiles(self):
         return self.kv_tiles - self.pure_video_kv_start
 
+    @property
+    def sparseable(self):
+        return self.pure_video_q_tiles > 0 and self.pure_video_kv_tiles > 0
+
 
 @dataclass(frozen=True)
 class SparseMaskMetadata:
@@ -144,14 +148,6 @@ class SparseTileRouter:
                 video_start + self.kv_tile - 1
             ) // self.kv_tile,
         )
-        if not geometry.pure_video_q_tiles:
-            raise SparseRouterError(
-                'packed layout has no pure-video query tiles'
-            )
-        if not geometry.pure_video_kv_tiles:
-            raise SparseRouterError(
-                'packed layout has no pure-video KV tiles'
-            )
         self._geometry_cache[signature] = geometry
         return geometry
 
@@ -176,6 +172,8 @@ class SparseTileRouter:
     @staticmethod
     def _retained(video_budget, geometry):
         video_budget = float(video_budget)
+        if not geometry.sparseable:
+            return geometry.pure_video_kv_tiles
         if video_budget <= 0.0:
             return 1
         if video_budget >= 1.0:
@@ -203,7 +201,9 @@ class SparseTileRouter:
         )
         return SparseMaskMetadata(
             requested_video_budget=float(video_budget),
-            actual_video_tile_density=float(retained) / pure_kv,
+            actual_video_tile_density=(
+                float(retained) / pure_kv if geometry.sparseable else 1.0
+            ),
             full_mask_density=float(true_blocks)
             / (geometry.q_tiles * geometry.kv_tiles),
             dense_q_tiles=geometry.q_tiles - sparse_q,

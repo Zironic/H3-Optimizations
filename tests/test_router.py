@@ -71,6 +71,54 @@ def decode(lut, valid):
 
 
 class RouterTests(unittest.TestCase):
+    def test_short_video_tile_boundaries_use_dense_routes(self):
+        class NoSelectionRouter(SparseTileRouter):
+            def _select_indices(self, *_args, **_kwargs):
+                raise AssertionError('dense boundary must not run Top-K')
+
+        video_start = 5263
+        cases = (
+            (64, 64, 5312, 0, 0),
+            (64, 64, 5313, 1, 1),
+            (64, 128, 5312, 0, 0),
+            (64, 128, 5313, 1, 0),
+            (64, 128, 5376, 1, 0),
+            (64, 128, 5377, 2, 1),
+            (128, 64, 5313, 0, 1),
+        )
+        for q_tile, kv_tile, sequence, pure_q, pure_kv in cases:
+            with self.subTest(
+                q_tile=q_tile,
+                kv_tile=kv_tile,
+                sequence=sequence,
+            ):
+                router = NoSelectionRouter(q_tile=q_tile, kv_tile=kv_tile)
+                current_layout = layout(sequence, video_start)
+                geometry = router.geometry(current_layout)
+                self.assertEqual(geometry.pure_video_q_tiles, pure_q)
+                self.assertEqual(geometry.pure_video_kv_tiles, pure_kv)
+
+                q = torch.randn((1, 2, sequence, 4))
+                routes = (
+                    router.build_lut(q, q, current_layout, 0.15),
+                    router.build_lut_from_summaries(
+                        router._mean_pool(q, q_tile),
+                        router._mean_pool(q, kv_tile),
+                        current_layout,
+                        0.15,
+                    ),
+                )
+                for lut, valid, metadata in routes:
+                    self.assertTrue(decode(lut, valid).all())
+                    self.assertEqual(
+                        metadata.retained_video_kv_tiles,
+                        pure_kv,
+                    )
+                    self.assertEqual(metadata.actual_video_tile_density, 1.0)
+                    self.assertEqual(metadata.full_mask_density, 1.0)
+                    self.assertEqual(metadata.sparse_q_tiles, 0)
+                    self.assertEqual(metadata.dense_q_tiles, geometry.q_tiles)
+
     def test_optional_early_ramp_is_bounded(self):
         config = HybridSparseConfig(
             video_budget=0.15,

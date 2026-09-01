@@ -1,6 +1,6 @@
 [project]
 name = 'h3-optimizations'
-version = '0.2.40'
+version = '0.2.41'
 description = 'Production sparse attention, token ordering, and memory optimization nodes for MiniMax H3 in ComfyUI'
 readme = 'README.md'
 requires-python = '>=3.10'
@@ -21,5 +21,3 @@ requires-comfyui = '>=0.33.0'
 
 [tool.ruff]
 line-length = 100
-
-# Registry publish retrigger for the 0.2.40 hotfix after correcting its CI fixture.
