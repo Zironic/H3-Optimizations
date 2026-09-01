@@ -104,7 +104,7 @@ class ForecastInteropTests(unittest.TestCase):
 
     def test_adapter_restores_only_target_video_rows_to_native_raster(self):
         audio_rows = 5
-        video_rows = 64
+        video_rows = 128
         hidden = 3
         layout = type(
             "Layout",
@@ -116,17 +116,18 @@ class ForecastInteropTests(unittest.TestCase):
             dtype=torch.float32,
         ).reshape(video_rows, hidden)
         forward, _inverse = tile_aligned_cube_major_indices(
-            (1, 8, 8),
+            (1, 8, 16),
             audio_rows,
             (1, 8, 8),
         )
+        self.assertNotEqual(tuple(forward), tuple(range(video_rows)))
         audio = torch.full((audio_rows, hidden), -7.0)
         cube_target = torch.cat((audio, raster_video[list(forward)]), dim=0).unsqueeze(0)
 
         restored = restore_forecast_target_hidden_to_raster(
             cube_target,
             layout=layout,
-            video_shape=(1, 16, 16),
+            video_shape=(1, 16, 32),
             patch_size=(1, 2, 2),
             cube_shape=(1, 8, 8),
         )
