@@ -64,15 +64,19 @@ class FakeModule:
 
 
 class FakePatcher:
-    def __init__(self, dynamic=True):
+    def __init__(self, dynamic=True, vbar=None):
         self.dynamic = dynamic
+        self.vbar = vbar
         self.callbacks = {}
 
     def is_dynamic(self):
         return self.dynamic
 
+    def _vbar_get(self):
+        return self.vbar
+
     def clone(self):
-        clone = FakePatcher(dynamic=self.dynamic)
+        clone = FakePatcher(dynamic=self.dynamic, vbar=self.vbar)
         clone.callbacks = {
             call_type: {
                 key: list(callbacks)
@@ -119,8 +123,8 @@ class AIMDOLimiterTests(unittest.TestCase):
         )
         self.assertEqual(residency.default, '0 blocks')
         self.assertEqual(residency.options[0], residency.default)
-        self.assertIn('default for benchmarking', residency.tooltip)
-        self.assertIn('keeps no H3 model blocks persistently resident', residency.tooltip)
+        self.assertIn('model-agnostic', residency.tooltip)
+        self.assertIn('keeps no DynamicVRAM VBAR pages persistently resident', residency.tooltip)
         self.assertIn('require DynamicVRAM', residency.tooltip)
 
     def test_block_budget_uses_page_footprints(self):
@@ -169,6 +173,28 @@ class AIMDOLimiterTests(unittest.TestCase):
         callbacks = patched.callbacks[CallbacksMP.ON_LOAD][aimdo_limiter.CALLBACK_KEY]
         self.assertEqual(len(callbacks), 1)
 
+    def test_node_arms_zero_residency_on_a_non_h3_dynamic_clone(self):
+        patcher = FakePatcher(vbar=FakeVBAR())
+        with patch.object(aimdo_limiter, 'is_minimax_h3', return_value=False):
+            output = aimdo_limiter.H3AIMDOResidencyLimiter.execute(
+                patcher,
+                residency='0 blocks',
+            )
+        patched = output.args[0]
+        self.assertIsNot(patched, patcher)
+        callbacks = patched.callbacks[CallbacksMP.ON_LOAD][aimdo_limiter.CALLBACK_KEY]
+        self.assertEqual(len(callbacks), 1)
+
+    def test_positive_block_budget_still_passes_through_non_h3_models(self):
+        patcher = FakePatcher()
+        with patch.object(aimdo_limiter, 'is_minimax_h3', return_value=False):
+            output = aimdo_limiter.H3AIMDOResidencyLimiter.execute(
+                patcher,
+                residency='2 blocks',
+            )
+        self.assertIs(output.args[0], patcher)
+        self.assertEqual(patcher.callbacks, {})
+
     def test_stock_removes_a_previous_limiter_from_the_clone(self):
         patcher = FakePatcher()
         aimdo_limiter.install_aimdo_limiter(patcher, 2)
@@ -200,12 +226,16 @@ class AIMDOLimiterTests(unittest.TestCase):
         self.assertEqual(vbar.get_watermark(), 5)
         self.assertFalse(any(value & 1 for value in vbar.residency[5:]))
 
-    def test_zero_block_callback_clears_all_vbar_residency(self):
+    def test_zero_block_callback_clears_generic_vbar_without_h3_discovery(self):
         vbar = FakeVBAR(pages=8)
-        patcher = FakePatcher()
+        patcher = FakePatcher(vbar=vbar)
         with (
             patch.object(aimdo_limiter.comfy.model_management, 'NUM_STREAMS', 2),
-            patch.object(aimdo_limiter, 'get_h3_blocks', return_value=blocks_for(vbar)),
+            patch.object(
+                aimdo_limiter,
+                'get_h3_blocks',
+                side_effect=AssertionError('generic zero residency must not inspect H3 blocks'),
+            ),
         ):
             aimdo_limiter._apply_residency_cap(patcher, 0)
         self.assertEqual(vbar.set_calls, [0])

@@ -1,4 +1,4 @@
-'''AIMDO VBAR residency cap for MiniMax H3.'''
+'''AIMDO VBAR residency cap, with H3 block-equivalent presets.'''
 
 import logging
 
@@ -76,19 +76,44 @@ def _residency_cap_pages(block_page_counts, block_equivalents):
     return sum(sorted(block_page_counts, reverse=True)[:block_equivalents])
 
 
+def _zero_residency_vbar(patcher):
+    get_vbar = getattr(patcher, '_vbar_get', None)
+    if callable(get_vbar):
+        return get_vbar()
+
+    # Compatibility fallback for older/test patchers that do not expose the
+    # DynamicVRAM VBAR directly. This fallback remains H3-specific.
+    blocks = get_h3_blocks(patcher)
+    if not blocks:
+        return None
+    vbar, _block_page_counts_unused = _block_page_counts(blocks)
+    return vbar
+
+
 def _apply_residency_cap(patcher, block_equivalents):
     if not patcher.is_dynamic():
         return
     if comfy.model_management.NUM_STREAMS <= 0:
         raise AIMDOResidencyLimiterError(
-            'H3 AIMDO Residency Limiter requires async weight offloading'
+            'AIMDO Residency Limiter requires async weight offloading'
         )
 
-    blocks = get_h3_blocks(patcher)
-    if not blocks:
-        return
-    vbar, block_page_counts = _block_page_counts(blocks)
-    cap_pages = _residency_cap_pages(block_page_counts, block_equivalents)
+    block_equivalents = int(block_equivalents)
+    if block_equivalents < 0:
+        raise ValueError('block_equivalents must be non-negative')
+
+    if block_equivalents == 0:
+        vbar = _zero_residency_vbar(patcher)
+        if vbar is None:
+            return
+        cap_pages = 0
+    else:
+        blocks = get_h3_blocks(patcher)
+        if not blocks:
+            return
+        vbar, block_page_counts = _block_page_counts(blocks)
+        cap_pages = _residency_cap_pages(block_page_counts, block_equivalents)
+
     native_pages = int(vbar.get_nr_pages())
     expected_pages = min(cap_pages, native_pages)
 
@@ -113,7 +138,7 @@ def _apply_residency_cap(patcher, block_equivalents):
     ]
     if resident_above:
         raise AIMDOResidencyLimiterError(
-            'AIMDO left %d H3 VBAR page(s) resident above the limiter watermark'
+            'AIMDO left %d VBAR page(s) resident above the limiter watermark'
             % len(resident_above)
         )
 
@@ -140,7 +165,7 @@ def install_aimdo_limiter(model_patcher, block_equivalents):
 
 
 class H3AIMDOResidencyLimiter(io.ComfyNode):
-    '''Limit persistent H3 AIMDO VBAR residency after dynamic model loading.'''
+    '''Limit persistent AIMDO VBAR residency after dynamic model loading.'''
 
     @classmethod
     def define_schema(cls):
@@ -149,13 +174,16 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
             display_name='H3 AIMDO Residency Limiter',
             category='H3-Optimizations/Model Patches',
             description=(
-                'Controls how much of the H3 model DynamicVRAM keeps resident in '
-                'VRAM. It is mainly useful for benchmarking, debugging AIMDO, or '
-                'forcing minimal persistent model residency on tight VRAM budgets. '
-                'It does not cap total GPU memory use.'
+                'Controls how much model weight DynamicVRAM keeps resident in VRAM. '
+                'The default 0 blocks setting works for any DynamicVRAM model; '
+                '1/2/4 block-equivalent settings remain H3-specific. It is mainly '
+                'useful for benchmarking, debugging AIMDO, or forcing minimal '
+                'persistent model residency on tight VRAM budgets. It does not cap '
+                'total GPU memory use.'
             ),
             search_aliases=[
                 'AIMDO Limiter',
+                'DynamicVRAM limiter',
                 'H3 DynamicVRAM limiter',
                 'H3 residency cap',
             ],
@@ -167,12 +195,12 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
                     options=list(RESIDENCY_OPTIONS),
                     default=DEFAULT_RESIDENCY,
                     tooltip=(
-                        '0 blocks keeps no H3 model blocks persistently resident and '
-                        'is the default for benchmarking and lowest-residency use. '
-                        'Higher values allow more model weight residency and may '
-                        'trade VRAM for less weight streaming. stock leaves ComfyUI '
-                        'AIMDO residency management unchanged. Numeric choices '
-                        'require DynamicVRAM and async weight offloading.'
+                        '0 blocks is model-agnostic and keeps no DynamicVRAM VBAR '
+                        'pages persistently resident. 1/2/4 blocks use H3 '
+                        'block-equivalent budgets and may trade VRAM for less weight '
+                        'streaming. stock leaves ComfyUI AIMDO residency management '
+                        'unchanged. Numeric choices require DynamicVRAM and async '
+                        'weight offloading.'
                     ),
                 ),
             ],
@@ -183,7 +211,7 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
     def execute(cls, model, residency=DEFAULT_RESIDENCY):
         if residency not in RESIDENCY_OPTIONS:
             raise ValueError('unknown AIMDO residency budget %r' % residency)
-        if not is_minimax_h3(model):
+        if residency != '0 blocks' and not is_minimax_h3(model):
             return io.NodeOutput(model)
 
         patched = model.clone()
@@ -204,10 +232,13 @@ class H3AIMDOResidencyLimiter(io.ComfyNode):
 
         block_equivalents = RESIDENCY_BLOCKS[residency]
         install_aimdo_limiter(patched, block_equivalents)
+        preview = (
+            'AIMDO residency limiter armed for zero persistent VBAR pages'
+            if block_equivalents == 0
+            else 'AIMDO residency limiter armed for %d block-equivalent(s)'
+            % block_equivalents
+        )
         return io.NodeOutput(
             patched,
-            ui=ui.PreviewText(
-                'AIMDO residency limiter armed for %d block-equivalent(s)'
-                % block_equivalents
-            ),
+            ui=ui.PreviewText(preview),
         )
