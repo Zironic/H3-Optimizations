@@ -1,8 +1,11 @@
 '''H3 attention forward with negotiated projected-QKV fallback.'''
 
+from weakref import WeakSet
+
 import comfy.ldm.minimax.model as h3_model
 import comfy.model_management
 import comfy.quant_ops
+from tqdm.auto import tqdm
 
 from . import diagnostics
 from .attention import AttentionBackendUnavailable
@@ -19,6 +22,151 @@ from .ordering_probe import has_ordering_observer, observe_attention
 
 
 DENSE_KITCHEN_PREQUANTIZED = 'comfy_kitchen_int8_prequantized'
+REFERENCE_KINDS = frozenset(('ref_img', 'ref_audio'))
+CONDITIONING_KINDS = frozenset(('cond', 'cond_audio'))
+_LOGGED_TOKEN_LAYOUTS = WeakSet()
+
+
+def _tqdm_info(message):
+    tqdm.write('\n'.join('[INFO] ' + line for line in message.splitlines()))
+
+
+def _range_for_kind(segments, kind):
+    for start, stop, segment_kind in segments:
+        if segment_kind == kind:
+            return start, stop
+    return None
+
+
+def _range_size(value):
+    return 0 if value is None else int(value[1]) - int(value[0])
+
+
+def _combined_range(segments):
+    if not segments:
+        return None
+    return int(segments[0][0]), int(segments[-1][1])
+
+
+def _format_tuple(value):
+    if value is None:
+        return 'none'
+    return '(' + ','.join(str(int(item)) for item in value) + ')'
+
+
+def _video_shape(layout):
+    value = getattr(layout, 'video_shape', None)
+    if value is not None:
+        return tuple(int(item) for item in value)
+    signature = getattr(layout, 'signature', ())
+    if len(signature) < 4:
+        return None
+    return int(signature[1]), int(signature[2]) // 2, int(signature[3]) // 2
+
+
+def _attention_route(backend_name):
+    if backend_name and 'sparse' in backend_name.lower():
+        return 'sparse'
+    return 'dense'
+
+
+def _attention_backend_label(backend_name):
+    return {
+        DENSE_KITCHEN_PREQUANTIZED: 'Comfy Kitchen INT8',
+    }.get(backend_name, backend_name or 'ComfyUI attention')
+
+
+def log_token_diagnostic_once(
+    x,
+    transformer_options,
+    *,
+    backend=None,
+    projector=None,
+    attention=None,
+):
+    '''Log shape-only packed-token metadata once for each ComfyUI sampling layout.'''
+    options = transformer_options or {}
+    layout = options.get('minimax_h3_layout')
+    if layout is None or layout in _LOGGED_TOKEN_LAYOUTS:
+        return
+    _LOGGED_TOKEN_LAYOUTS.add(layout)
+
+    segments = tuple(
+        (int(start), int(stop), str(kind))
+        for start, stop, kind in getattr(layout, 'segments', ())
+    )
+    text_range = _range_for_kind(segments, 'text')
+    audio_range = _range_for_kind(segments, 'audio')
+    video_range = _range_for_kind(segments, 'video')
+    reference_segments = tuple(
+        segment for segment in segments if segment[2] in REFERENCE_KINDS
+    )
+    conditioning_segments = tuple(
+        segment for segment in segments if segment[2] in CONDITIONING_KINDS
+    )
+    conditioning_range = _combined_range(conditioning_segments)
+
+    packed = int(x.shape[0])
+    layout_total = getattr(layout, 'seq_len', None)
+    layout_total = None if layout_total is None else int(layout_total)
+    text_tokens = _range_size(text_range)
+    reference_tokens = sum(stop - start for start, stop, _kind in reference_segments)
+    conditioning_tokens = sum(
+        stop - start for start, stop, _kind in conditioning_segments
+    )
+    audio_tokens = _range_size(audio_range)
+    video_tokens = _range_size(video_range)
+    component_total_without_conditioning = (
+        text_tokens + reference_tokens + audio_tokens + video_tokens
+    )
+    component_total_with_conditioning = (
+        component_total_without_conditioning + conditioning_tokens
+    )
+
+    backend_name = getattr(backend, 'name', None)
+    if backend_name is None and attention is not None:
+        backend_name = getattr(attention, '__name__', type(attention).__name__)
+    streamed_q = bool(getattr(projector, 'streamed_q', False))
+    if projector is not None and type(projector).__name__.startswith('Streamed'):
+        streamed_q = True
+    q_chunk = getattr(backend, 'query_chunk_rows', None)
+    if q_chunk is None:
+        q_chunk = getattr(projector, 'chunk_rows', None)
+
+    reference_detail = ','.join(
+        '%s[%d:%d]=%d' % (kind, start, stop, stop - start)
+        for start, stop, kind in reference_segments
+    ) or 'none'
+    segment_detail = ','.join(
+        '%s[%d:%d]=%d' % (kind, start, stop, stop - start)
+        for start, stop, kind in segments
+    ) or 'none'
+    component_check = (
+        'ok'
+        if component_total_with_conditioning == packed == layout_total
+        else ('unavailable' if layout_total is None else 'mismatch')
+    )
+
+    main_line = (
+        f'[H3 Tokens] packed={packed} layout_total={layout_total} '
+        f'text_tokens={text_tokens} conditioning_tokens={conditioning_tokens} '
+        f'reference_tokens={reference_tokens} audio_tokens={audio_tokens} '
+        f'video_tokens={video_tokens} video_shape={_format_tuple(_video_shape(layout))} '
+        f'q_total={packed} route={_attention_route(backend_name)} '
+        f'backend={_attention_backend_label(backend_name)} '
+        f'qkv_streaming={"on" if streamed_q else "off"} q_chunk={q_chunk} '
+        f'component_total_without_conditioning={component_total_without_conditioning} '
+        f'component_total_with_conditioning={component_total_with_conditioning} '
+        f'component_check={component_check}'
+    )
+    detail_line = (
+        f'[H3 Tokens Detail] text_range={_format_tuple(text_range)} '
+        f'conditioning_range={_format_tuple(conditioning_range)} '
+        f'reference_segments={len(reference_segments)} reference_detail={reference_detail} '
+        f'audio_range={_format_tuple(audio_range)} video_range={_format_tuple(video_range)} '
+        f'segments={segment_detail}'
+    )
+    _tqdm_info(f'{main_line}\n{detail_line}')
 
 
 class _AttentionOutProjectionProxy:
@@ -360,6 +508,14 @@ def make_forward(
         transformer_options = (
             transformer_options if transformer_options is not None else {}
         )
+        if int(layer_index) == 0:
+            log_token_diagnostic_once(
+                x,
+                transformer_options,
+                backend=backend,
+                projector=projector,
+                attention=attention,
+            )
         norm1_source = transformer_options.get(NORM1_SOURCE_KEY)
         if norm1_source is not None:
             # The lazy source is an implementation detail of our QKV projector.
