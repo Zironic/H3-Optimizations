@@ -97,9 +97,11 @@ EMBEDDING_MEMORY_REQUESTS = (
 
 V_MEMORY_RETAIN = 'retain'
 V_MEMORY_TWO_PASS = 'two_pass'
+V_MEMORY_BLOCK = 'blockwise'
 V_MEMORY_REQUESTS = (
     V_MEMORY_RETAIN,
     V_MEMORY_TWO_PASS,
+    V_MEMORY_BLOCK,
 )
 # Two-pass V started out Kitchen-only. It now also covers the Sage FP8
 # carriers, so the neutral names above are canonical; these aliases keep the
@@ -355,6 +357,8 @@ class H3OptimizationPlan:
     sparse: SparseRequest | None = None
 
     def __post_init__(self):
+        if self.memory is not None and self.memory.attention_v_memory == V_MEMORY_BLOCK and self.sparse is not None:
+            raise ValueError('Single-pass V currently requires dense attention; disconnect H3 Sparse Attention')
         if int(self.version) != PLAN_VERSION:
             raise ValueError(
                 'unsupported H3 optimization plan version %r' % self.version

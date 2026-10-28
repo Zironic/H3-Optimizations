@@ -1001,12 +1001,13 @@ __device__ __forceinline__ void normalize_d(float RO[][num_tiles_v][8],
 
 template <uint32_t num_warps_q, uint32_t num_warps_k, uint32_t num_tiles_q,
           uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode,
-          uint32_t stride, typename DTypeSVAccum>
+          uint32_t stride, bool block_v_scale = false, typename DTypeSVAccum>
 __device__ __forceinline__ void
 compute_int8_sv(const smem_t<swizzle_mode, stride> &smem_V,
                 int32_t RS_scale[][num_tiles_k][8],
                 uint32_t RS_u8[][num_tiles_k / 2][4],
-                DTypeSVAccum RO[][num_tiles_v][8]) {
+                DTypeSVAccum RO[][num_tiles_v][8],
+                const float *v_scale = nullptr) {
   static_assert(std::is_same<DTypeSVAccum, float>::value);
   uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
   uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
@@ -1036,8 +1037,13 @@ compute_int8_sv(const smem_t<swizzle_mode, stride> &smem_V,
       }
 #pragma unroll
       for (uint32_t k = 0; k < 8; k++) {
+        float scale = __int_as_float(RS_scale[fq][0][(k % 4) / 2]);
+        if constexpr (block_v_scale) {
+          scale *= v_scale[fv * 16 + (get_lane_id() % 4) * 2 +
+                           (k / 4) * 8 + (k % 2)];
+        }
         RO[fq][fv][k] = fmaf(__int2float_rn(partial[k]),
-                              __int_as_float(RS_scale[fq][0][(k % 4) / 2]),
+                              scale,
                               RO[fq][fv][k]);
       }
     }

@@ -19,6 +19,7 @@
 // chunk, so for SUB_K in {32, 64} every thread's K and V addresses come from
 // exactly one subtile. Only the per-thread K dequant scale differs across the
 // thread's columns, one per subtile.
+// Dense SUB_K=128 retains the ordinary 128-token K quantization grid.
 
 #pragma once
 
@@ -95,7 +96,7 @@ __device__ __forceinline__ void update_mdo_i32_u8_packed(
 }
 
 template <uint32_t SUB_K, typename DTypeOut, bool return_lse,
-          uint32_t MIN_BLOCKS, bool DENSE = false>
+          uint32_t MIN_BLOCKS, bool DENSE = false, bool block_v_scale = false>
 __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -110,12 +111,14 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     const uint32_t stride_h_o, const uint32_t stride_bz_q_scale,
     const uint32_t stride_h_q_scale, float sm_scale,
     const int32_t *__restrict__ BlockLut,
-    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
+    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride,
+    const uint32_t v_scale_rows = 0) {
   constexpr uint32_t CTA_Q = 64;
   constexpr uint32_t CTA_K = 128;
   constexpr uint32_t WARP_Q = 16;
   constexpr uint32_t head_dim = 128;
-  static_assert(SUB_K == 32 || SUB_K == 64, "SUB_K must be 32 or 64");
+  static_assert(SUB_K == 32 || SUB_K == 64 || (SUB_K == 128 && DENSE),
+                "128-token carriers require dense traversal");
   constexpr uint32_t N_SUB = CTA_K / SUB_K;
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = 1;
@@ -139,6 +142,18 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
   const uint32_t kv_head = head_id / num_kv_groups;
+  const uint32_t scale_rows = v_scale_rows ? v_scale_rows : SUB_K;
+  const uint32_t tiles_per_scale = scale_rows / SUB_K;
+  const bool scale_power_of_two = (tiles_per_scale & (tiles_per_scale - 1)) == 0;
+  const uint32_t scale_shift = __ffs(tiles_per_scale) - 1;
+  auto v_scale_for_block = [&](uint32_t block) -> const float * {
+    if constexpr (block_v_scale) {
+      const uint32_t index = scale_power_of_two ? block >> scale_shift : block / tiles_per_scale;
+      const uint32_t head = batch_id * (num_qo_heads / num_kv_groups) + kv_head;
+      return V_scale + (static_cast<int64_t>(head) * div_ceil(kv_len, scale_rows) + index) * head_dim;
+    }
+    return nullptr;
+  };
 
   sm_scale *= math::log2e;
 
@@ -374,8 +389,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     cp_async::wait_group<1>();
     __syncthreads();
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, block_v_scale>(
+        smem_V, RS, RS_u8, RO, v_scale_for_block(cur[0]));
     __syncthreads();
 
     load_V(nxt);
@@ -426,14 +441,14 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     cp_async::wait_group<0>();
     __syncthreads();
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, block_v_scale>(
+        smem_V, RS, RS_u8, RO, v_scale_for_block(cur[0]));
     __syncthreads();
   }
 
   normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
 
-  {
+  if constexpr (!block_v_scale) {
     float v_scale[4];
     const float *V_scale_base_ptr =
         V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +

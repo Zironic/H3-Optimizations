@@ -74,6 +74,9 @@ class PrequantizedInt8Attention:
     Field-for-field the same as Kitchen's carrier, including the anchor the
     quantizer centred K on -- a producer claiming to emit these has to
     reproduce the anchor choice, not only the packed bytes.
+
+    For block-scaled V, v_scale_rows is the token count per [B,H,block,D]
+    scale. Zero denotes cta_k rows per block.
     """
 
     q: torch.Tensor
@@ -87,6 +90,7 @@ class PrequantizedInt8Attention:
     attention_scale: float
     cta_k: int
     anchor_indices: torch.Tensor | None = None
+    v_scale_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -433,8 +437,7 @@ def _attention_geometry(quantized, output_layout=OUTPUT_HND):
             q_length * kernel_head_dim,
         )
     strides = (
-        q_heads * q_length * kernel_head_dim, kernel_head_dim,
-        q_length * kernel_head_dim,
+        quantized.q.stride(0), quantized.q.stride(2), quantized.q.stride(1),
         kv_heads * kv_length * kernel_head_dim, kernel_head_dim,
         kv_length * kernel_head_dim,
         kv_heads * kernel_head_dim * padded_k_length,
@@ -456,6 +459,11 @@ def int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
     )
+    if quantized.v_scale.ndim == 4:
+        from .block_v import attention
+
+        attention(quantized, output, output_dtype, geometry, strides)
+        return _finish(quantized, output)
     loader.check(
         library.h3_int8_dense_attention(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),

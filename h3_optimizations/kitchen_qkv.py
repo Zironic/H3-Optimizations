@@ -12,7 +12,7 @@ import comfy.quant_ops
 from . import diagnostics
 from .attention_forward import project_qkv
 from .native.int8_attention import carrier_kv_tile
-from .normalized_rows import attention_output_buffer
+from .normalized_rows import NormalizedRows, attention_output_buffer
 from .qkv.bf16 import HeldBF16QKV
 from .qkv.chunked import project_chunk_hnd
 from .qkv.formats import describe_linear
@@ -34,7 +34,8 @@ from .qkv.w4a8 import HeldW4A8QKV, W4A8BindingError
 CHUNK_ROWS = 4096
 V_MODE_RETAIN = 'retain'
 V_MODE_TWO_PASS = 'two_pass'
-V_MODES = (V_MODE_RETAIN, V_MODE_TWO_PASS)
+V_MODE_BLOCK = 'blockwise'
+V_MODES = (V_MODE_RETAIN, V_MODE_TWO_PASS, V_MODE_BLOCK)
 STRIDED_QK_CAPABILITY = 'SUPPORTS_STRIDED_QK_CHUNK'
 PRODUCER_ABI_VERSION = 1
 PRODUCER_ABI = 'external_v%d' % PRODUCER_ABI_VERSION
@@ -240,6 +241,9 @@ def run_chunked_kitchen_qkv(
                 allow_float_conversion=getattr(fmt, 'plain_float', False),
             )
             held.__enter__()
+        elif v_mode == V_MODE_BLOCK and getattr(fmt, 'convrot_int8_256', False):
+            held = HeldConvRotINT8QKV(module, x[:1])
+            held.__enter__()
         elif fp8_projection:
             held = HeldFP8QKV(
                 module,
@@ -273,6 +277,15 @@ def run_chunked_kitchen_qkv(
         if v_mode not in V_MODES:
             raise FusedQKVError('unknown Kitchen V mode %r' % v_mode)
         staging = None
+        single_pass = None
+        if v_mode == V_MODE_BLOCK:
+            from .native.block_v import SinglePassVCarrier, available
+
+            if module.to_gate_compress is not None:
+                raise FusedQKVError('Single-pass V does not support trained VSA attention')
+            if int(spec.kernel_head_dim) != 128 or not available():
+                raise FusedQKVError('Single-pass V requires head_dim 128 and the H3 block-V library')
+            single_pass = SinglePassVCarrier(spec, block_rows=int(chunk_rows))
         if v_mode == V_MODE_TWO_PASS:
             from .native.v_staging import TwoPassVCarrier
 
@@ -290,7 +303,7 @@ def run_chunked_kitchen_qkv(
                 end,
                 projector=held,
             )
-            if staging is None and retained_v is None:
+            if staging is None and single_pass is None and retained_v is None:
                 retained_v = v.new_empty(
                     (1, int(module.heads), sequence, int(module.head_dim))
                 )
@@ -306,7 +319,9 @@ def run_chunked_kitchen_qkv(
                 k_start=start,
                 **chunk_kwargs,
             )
-            if staging is None:
+            if single_pass is not None:
+                single_pass.quantize(v, start)
+            elif staging is None:
                 with diagnostics.stage('v_retention_copy'):
                     retained_v[:, :, start:end, :].copy_(v)
             else:
@@ -314,7 +329,10 @@ def run_chunked_kitchen_qkv(
                     staging.update(v)
             del q, k, v
 
-        if staging is None:
+        if single_pass is not None:
+            producer.v, producer.v_scale = single_pass.finish()
+            producer.v_scale_rows = single_pass.block_rows
+        elif staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
             del retained_v
         else:
@@ -515,6 +533,8 @@ class ChunkedKitchenQKVProjector:
     ):
         kitchen = resolve_kitchen(x.device)
         if kitchen is None:
+            if self.v_mode == V_MODE_BLOCK:
+                raise FusedQKVError('Single-pass V requires the native Kitchen INT8 producer')
             return None
         fmt = describe_linear(module.qkv_proj)
         native_bf16 = _native_bf16_format(fmt)
@@ -553,10 +573,13 @@ class ChunkedKitchenQKVProjector:
             or not format_ok
             or not producer_api_available(kitchen, x.device)
         ):
+            if self.v_mode == V_MODE_BLOCK:
+                raise FusedQKVError('Single-pass V requires compatible CUDA H3 QKV weights and dense Kitchen attention')
             return None
 
         use_streamed_q = bool(
             self.streamed_q
+            and self.v_mode != V_MODE_BLOCK
             and _supports_streamed_producer(kitchen, x.device)
         )
         shape = (1, int(module.heads), int(x.shape[0]), int(module.head_dim))
@@ -578,11 +601,15 @@ class ChunkedKitchenQKVProjector:
                 **spec_kwargs,
             )
         except kitchen.Int8AttentionProducerUnavailableError:
+            if self.v_mode == V_MODE_BLOCK:
+                raise
             return None
         if (
             getattr(spec, 'abi_version', None) != PRODUCER_ABI_VERSION
             or self.chunk_rows % int(spec.sequence_alignment)
         ):
+            if self.v_mode == V_MODE_BLOCK:
+                raise FusedQKVError('Single-pass V requires producer-compatible aligned projection chunks')
             return None
         try:
             with diagnostics.stage('qkv_producer_total'):
@@ -638,7 +665,7 @@ class ChunkedKitchenQKVProjector:
             if (
                 self.force_weights_bf16
                 or self.convrot_int8_projection
-                or self.v_mode == V_MODE_TWO_PASS
+                or self.v_mode in (V_MODE_TWO_PASS, V_MODE_BLOCK)
             ):
                 raise
             if (
@@ -710,6 +737,12 @@ class ChunkedKitchenAttentionBackend:
         from .native.int8_attention import OUTPUT_NHD
 
         quantized = prepared.carrier
+        if (
+            isinstance(prepared.output_buffer, NormalizedRows)
+            and prepared.output_buffer.attention_residual_pending
+            and quantized.v_scale.ndim == 4
+        ):
+            return self._execute_block_v_residual(module, prepared, kitchen)
         output = attention_output_buffer(prepared.output_buffer)
         streamed_q = isinstance(prepared, PreparedStreamedKitchenQKV)
         sequence = int(prepared.x.shape[0]) if streamed_q else int(quantized.q.shape[-2])
@@ -723,26 +756,26 @@ class ChunkedKitchenAttentionBackend:
                 quantized.q_scale.shape[-1] // packed_q_tiles
             )
 
+        held = None
         try:
+            if streamed_q:
+                binding = create_held_qkv(
+                    prepared.module,
+                    prepared.x[:1],
+                    prepared.projection_mode,
+                )
+                binding.__enter__()
+                held = binding
             for start in range(0, sequence, self.query_chunk_rows):
                 stop = min(start + self.query_chunk_rows, sequence)
                 if streamed_q:
-                    held = create_held_qkv(
-                        prepared.module,
-                        prepared.x[start:start + 1],
-                        prepared.projection_mode,
+                    q = project_q_hnd(
+                        held,
+                        prepared.x,
+                        prepared.rope_freqs,
+                        start,
+                        stop,
                     )
-                    held.__enter__()
-                    try:
-                        q = project_q_hnd(
-                            held,
-                            prepared.x,
-                            prepared.rope_freqs,
-                            start,
-                            stop,
-                        )
-                    finally:
-                        held.__exit__(None, None, None)
                     chunk_carrier = _quantize_q_chunk(kitchen, quantized, q)
                     q_scale = chunk_carrier.q_scale
                 else:
@@ -768,5 +801,27 @@ class ChunkedKitchenAttentionBackend:
                     output[start:stop].copy_(module.out_proj(flat.squeeze(0)))
                 del raw, flat, chunk_carrier, q, q_scale
             return output
+        finally:
+            if held is not None:
+                held.__exit__(None, None, None)
+            prepared.release()
+
+    def _execute_block_v_residual(self, module, prepared, kitchen):
+        source = prepared.output_buffer
+        carrier = prepared.carrier
+        sequence = int(source.shape[0])
+        try:
+            residual_projection = getattr(module, '_h3_out_proj_residual', lambda *args: False)
+            for start in range(0, sequence, self.query_chunk_rows):
+                stop = min(start + self.query_chunk_rows, sequence)
+                chunk = replace(
+                    carrier, q=carrier.q[..., start:stop, :],
+                    q_scale=carrier.q_scale[..., (start // 128) * 32:((stop + 127) // 128) * 32],
+                )
+                raw = kitchen.int8_attention_from_prequantized(chunk, output_layout='nhd')
+                rows = raw.transpose(1, 2).reshape(stop - start, module.heads * module.head_dim)
+                source.write_attention_residual(rows, start, stop, module.out_proj, residual_projection)
+                del rows, raw, chunk
+            return source.finish_attention_residual()
         finally:
             prepared.release()

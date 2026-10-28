@@ -91,6 +91,7 @@ class Int8AttentionProducer:
     _q_ranges: list = field(default_factory=list, repr=False)
     _k_ranges: list = field(default_factory=list, repr=False)
     _finalized: bool = field(default=False, repr=False)
+    v_scale_rows: int = 0
 
 
 def int8_attention_producer_is_available(device=None):
@@ -534,4 +535,5 @@ def finalize_int8_attention_producer(producer):
         attention_scale=spec.attention_scale,
         cta_k=spec.cta_k,
         anchor_indices=producer.anchor.indices,
+        v_scale_rows=producer.v_scale_rows,
     )

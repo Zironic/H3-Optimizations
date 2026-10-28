@@ -218,14 +218,14 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(attention_memory.display_name, 'Attention memory mode')
         self.assertEqual(
             attention_memory.options,
-            ['Standard', 'Lower VRAM (slower)'],
+            ['Standard', 'Lower VRAM (slower)', 'Single-pass V + direct residual (experimental)'],
         )
         self.assertEqual(attention_memory.default, KITCHEN_V_MEMORY_MODE_RETAIN)
         visible_text = ' '.join(
             [attention_memory.display_name, attention_memory.tooltip]
             + attention_memory.options
         ).lower()
-        self.assertNotIn('kitchen', visible_text)
+        self.assertIn('single-pass', visible_text)
         self.assertNotIn('two-pass', visible_text)
         self.assertNotIn('bf16 v', visible_text)
 

@@ -67,6 +67,8 @@ def format_qkv_execution(status):
     """
     text = _format_qkv_execution(status)
     qkv = status.get('fused_qkv') or {}
+    if qkv.get('v_memory') == 'blockwise':
+        return 'one-pass QKV -> packed INT8 Q/K + block-scaled INT8 V -> dense attention (packed on eligible long rows); direct residual on owned blocks (experimental quantization)'
     if qkv.get('v_memory') == 'two_pass' and 'two-pass V' not in text:
         text = text.replace(
             'retained native Sage K/V',

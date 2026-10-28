@@ -86,6 +86,27 @@ This node is different from Sparse Attention: it changes how the work is
 executed and stored rather than intentionally removing video attention
 connections.
 
+## Experimental single-pass V and direct residual
+
+In **H3 Memory Optimization**, choose **Attention memory mode: Single-pass V +
+direct residual (experimental)**. This explicitly selects dense Kitchen INT8;
+disconnect other H3 block/attention patches. Sparse Attention and trained VSA
+checkpoints are unsupported in this mode.
+
+Q/K/V are projected together once per chunk. V is quantized immediately with
+per-block channel scales, and packed INT8 Q is retained so attention output can
+be projected and gated directly into the residual without overwriting future
+queries. It avoids V reprojection and the full hidden-size output buffer.
+Per-block V quantization changes numerical results; rendered-video quality and
+full-workflow speed/peak VRAM have not yet been measured. Existing modes and
+defaults are unchanged.
+
+The local Windows build is `native/bin/h3_block_v_v3.dll` (SM89 SASS plus SM80 PTX).
+Rebuild from a PowerShell terminal with CUDA and Visual Studio C++ Build Tools:
+`./native/build_block_v.ps1`. A missing library fails explicitly in this mode.
+
+Correctness checks: `tests/test_block_v.py` and `tests/test_block_v_cuda.py`.
+
 ## H3 Sparse Attention
 
 Sparse Attention reduces the amount of video-to-video attention H3 calculates.

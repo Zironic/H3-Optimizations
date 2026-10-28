@@ -319,21 +319,73 @@ class StreamedKitchenOutputTests(unittest.TestCase):
             stream_output=True,
             query_chunk_rows=128,
         )
+        held = mock.MagicMock(wraps=Held())
         with mock.patch(
             'h3_optimizations.kitchen_qkv.resolve_kitchen',
             return_value=kitchen,
         ), mock.patch(
             'h3_optimizations.kitchen_qkv.create_held_qkv',
-            return_value=Held(),
-        ), mock.patch(
+            return_value=held,
+        ) as acquire, mock.patch(
             'h3_optimizations.kitchen_qkv.project_q_hnd',
             side_effect=project_q,
         ):
             actual = backend.execute_projected(_Module(), prepared)
 
         self.assertIs(actual, source.output_buffer())
+        acquire.assert_called_once()
+        held.__enter__.assert_called_once()
+        held.__exit__.assert_called_once()
         self.assertTrue(torch.equal(residual, source.materialize()))
         torch.testing.assert_close(actual, residual)
+
+    def test_dense_streamed_q_releases_weights_and_carrier_on_error(self):
+        for failure in ('acquire', 'projection', 'quantize', 'attention', 'output'):
+            with self.subTest(failure=failure):
+                module = mock.Mock(heads=2, head_dim=128)
+                module.out_proj.side_effect = lambda rows: rows
+                source = torch.zeros(257, 256)
+                prepared = PreparedStreamedKitchenQKV(
+                    module, source, None, object(), 'native', source,
+                )
+                held = mock.MagicMock()
+                error = RuntimeError('failed ' + failure)
+                kernel = mock.Mock(side_effect=lambda chunk, **kwargs: chunk.q)
+
+                def project(binding, rows, rope, start, stop):
+                    self.assertIs(binding, held)
+                    held.__enter__.assert_called_once()
+                    held.__exit__.assert_not_called()
+                    return rows[start:stop].reshape(1, stop - start, 2, 128).transpose(1, 2)
+
+                projection = mock.Mock(side_effect=project)
+                quantize = mock.Mock(side_effect=lambda kitchen, carrier, q: mock.Mock(q=q, q_scale=torch.ones(1)))
+                failing = {
+                    'acquire': held.__enter__,
+                    'projection': projection,
+                    'quantize': quantize,
+                    'attention': kernel,
+                    'output': module.out_proj,
+                }[failure]
+                failing.side_effect = error
+                kitchen = mock.Mock(int8_attention_from_prequantized=kernel)
+                backend = ChunkedKitchenAttentionBackend(stream_output=True, query_chunk_rows=128)
+                with (
+                    mock.patch('h3_optimizations.kitchen_qkv.resolve_kitchen', return_value=kitchen),
+                    mock.patch('h3_optimizations.kitchen_qkv.create_held_qkv', return_value=held) as acquire,
+                    mock.patch('h3_optimizations.kitchen_qkv.project_q_hnd', projection),
+                    mock.patch('h3_optimizations.kitchen_qkv._quantize_q_chunk', quantize),
+                    self.assertRaisesRegex(RuntimeError, 'failed ' + failure),
+                ):
+                    backend.execute_projected(module, prepared)
+                acquire.assert_called_once()
+                if failure == 'acquire':
+                    held.__exit__.assert_not_called()
+                else:
+                    held.__exit__.assert_called_once()
+                self.assertIsNone(prepared.carrier)
+                self.assertIsNone(prepared.x)
+                self.assertIsNone(prepared.output_buffer)
 
     def test_sparse_kitchen_streamed_q_keeps_lazy_input_separate_from_output(self):
         class Held:

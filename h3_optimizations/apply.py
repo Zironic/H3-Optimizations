@@ -454,6 +454,11 @@ def _resolve_dense(plan, model, inventory, environment=None):
     )
     backend = None
     projector = None
+    if memory is not None and memory.attention_v_memory == 'blockwise' and qkv.provider_id not in (
+        QKV_DENSE_KITCHEN_CHUNKED, QKV_DENSE_FP8_CHUNKED,
+        QKV_FORCE_CONVROT_INT8_KITCHEN, QKV_FORCE_BF16_STREAMED_KITCHEN,
+    ):
+        raise RuntimeError('Single-pass V requires a compatible dense Kitchen INT8 QKV path')
     if (
         dense_sage
         and qkv.provider_id != QKV_STANDARD

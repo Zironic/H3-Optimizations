@@ -33,6 +33,7 @@ from .plan import (
     QKV_STREAMING_AUTO,
     QKV_STREAMING_FORCED,
     QKV_STREAMING_OFF,
+    V_MEMORY_BLOCK,
     MemoryRequest,
     read_plan,
 )
@@ -75,9 +76,11 @@ EMBEDDING_MEMORY_MODE_OPTIONS = (
 
 KITCHEN_V_MEMORY_MODE_RETAIN = 'Standard'
 KITCHEN_V_MEMORY_MODE_TWO_PASS = 'Lower VRAM (slower)'
+KITCHEN_V_MEMORY_MODE_BLOCK = 'Single-pass V + direct residual (experimental)'
 KITCHEN_V_MEMORY_MODE_OPTIONS = (
     KITCHEN_V_MEMORY_MODE_RETAIN,
     KITCHEN_V_MEMORY_MODE_TWO_PASS,
+    KITCHEN_V_MEMORY_MODE_BLOCK,
 )
 
 
@@ -114,6 +117,8 @@ def _memory_request_for_modes(
     del fused_qkv
     precision_mode = _normalize_precision_mode(precision_mode)
     streaming = _qkv_streaming_request(qkv_streaming_mode)
+    if kitchen_v_memory_mode == KITCHEN_V_MEMORY_MODE_BLOCK:
+        streaming = QKV_STREAMING_FORCED
 
     # Off and Auto preserve the current dense attention backend. Auto adds a
     # compatible streamed QKV carrier around that consumer; Forced explicitly
@@ -154,6 +159,7 @@ def _memory_request_for_modes(
     v_memory_requests = {
         KITCHEN_V_MEMORY_MODE_RETAIN: KITCHEN_V_MEMORY_RETAIN,
         KITCHEN_V_MEMORY_MODE_TWO_PASS: KITCHEN_V_MEMORY_TWO_PASS,
+        KITCHEN_V_MEMORY_MODE_BLOCK: V_MEMORY_BLOCK,
     }
     try:
         v_memory_request = v_memory_requests[kitchen_v_memory_mode]
@@ -327,7 +333,9 @@ class H3MemoryOptimization(io.ComfyNode):
                     advanced=True,
                     tooltip=(
                         'Standard prioritizes speed. Lower VRAM uses additional '
-                        'attention work to reduce peak memory.'
+                        'attention work to reduce peak memory. Single-pass V is experimental: '
+                        'forces dense Kitchen INT8, uses per-block V scales and direct residual output. '
+                        'Changes quantization; requires the compiled block-V library.'
                     ),
                 ),
             ],

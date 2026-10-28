@@ -56,7 +56,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           MaskMode mask_mode = MaskMode::kNone, bool return_lse = false,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true, bool block_v_scale = false>
 __global__ void qk_int_sv_i8_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -71,7 +71,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
     const uint32_t stride_seq_k, const uint32_t stride_h_k,
     const uint32_t stride_bz_v, const uint32_t stride_h_v,
     const uint32_t stride_d_v, const uint32_t stride_bz_o,
-    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale) {
+    const uint32_t stride_seq_o, const uint32_t stride_h_o, float sm_scale,
+    const uint32_t v_scale_rows = 0) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -376,6 +377,21 @@ __global__ void qk_int_sv_i8_attn_kernel(
 
   K_load_idx_lane_base += CTA_K;
 
+  const uint32_t scale_rows = v_scale_rows ? v_scale_rows : CTA_K;
+  const uint32_t tiles_per_scale = scale_rows / CTA_K;
+  const bool scale_power_of_two = (tiles_per_scale & (tiles_per_scale - 1)) == 0;
+  const uint32_t scale_shift = __ffs(tiles_per_scale) - 1;
+  const uint32_t scale_blocks = div_ceil(kv_len, scale_rows);
+  auto v_scale_for_tile = [&](uint32_t tile) -> const float * {
+    if constexpr (block_v_scale) {
+      const uint32_t head = batch_id * (num_qo_heads / num_kv_groups) +
+                            head_id / num_kv_groups;
+      const uint32_t block = scale_power_of_two ? tile >> scale_shift : tile / tiles_per_scale;
+      return V_scale + (static_cast<int64_t>(head) * scale_blocks + block) * head_dim;
+    }
+    return nullptr;
+  };
+
 #pragma unroll
   for (uint32_t iter = 1; iter < num_iterations - 1; iter++) {
     // ensure K is ready
@@ -463,8 +479,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
     __syncthreads();
 
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, block_v_scale>(
+        smem_V, RS, RS_u8, RO, v_scale_for_tile(iter - 1));
     __syncthreads();
     // load V
     load_int8_V_global_to_share<
@@ -571,8 +587,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
     __syncthreads();
 
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, block_v_scale>(
+        smem_V, RS, RS_u8, RO, v_scale_for_tile(num_iterations - 2));
 
     __syncthreads();
     // load V
@@ -661,8 +677,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
     __syncthreads();
 
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, block_v_scale>(
+        smem_V, RS, RS_u8, RO, v_scale_for_tile(num_iterations - 1));
 
     __syncthreads();
   }
@@ -697,7 +713,7 @@ __global__ void qk_int_sv_i8_attn_kernel(
   }
 
   // ! here we just implement the case for fp32 acumulation
-  if constexpr (fuse_v_scale) {
+  if constexpr (fuse_v_scale && !block_v_scale) {
     float v_scale[4];
     float *V_scale_base_ptr =
         V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
