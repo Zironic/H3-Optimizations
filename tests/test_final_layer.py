@@ -172,6 +172,91 @@ class FinalLayerTests(unittest.TestCase):
             (7, 11, torch.tensor([1, 0, 0, 1])),
         ))
 
+    def test_per_token_modulation_gathers_are_bounded(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = (
+            (0, 7, torch.tensor([0, 1, 0, 1, 1, 0, 1])),
+            (7, 11, torch.tensor([1, 0, 0, 1])),
+        )
+        expected = layer.forward(x, None, *segments)
+        gathers = []
+
+        class BoundedRows:
+            def __init__(self, values):
+                self.values = values
+                self.shape = values.shape
+
+            def __radd__(self, value):
+                return BoundedRows(value + self.values)
+
+            def __getitem__(self, index):
+                gathers.append(index.numel())
+                return self.values[index]
+
+        modulation = tuple(BoundedRows(v) for v in layer.adaln_proj(None))
+        with mock.patch.object(layer, 'adaln_proj', return_value=modulation):
+            actual = final_layer.chunked_final_layer(
+                layer, x, None, *segments, chunk_rows=3,
+            )
+        self.assertLessEqual(max(gathers), 3)
+        self.assertEqual(sum(gathers), 22)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=0)
+
+    def test_chunk_outputs_do_not_require_concatenation(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = ((0, 7, 0), (7, 11, 1))
+        expected = layer.forward(x, None, *segments)
+        with mock.patch.object(torch, 'cat', side_effect=AssertionError('unbounded copy')):
+            actual = final_layer.chunked_final_layer(
+                layer, x, None, *segments, chunk_rows=3,
+            )
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=0)
+
+    def test_large_modulation_table_is_not_expanded(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        shift, scale = layer.adaln_proj(None)
+        shift, scale = shift.repeat(5, 1), scale.repeat(5, 1)
+        segments = ((0, 7, torch.arange(7)), (7, 11, torch.arange(4)))
+
+        class ScaleTable:
+            shape = scale.shape
+
+            def __getitem__(self, index):
+                return scale[index]
+
+            def __radd__(self, _other):
+                raise AssertionError('the whole modulation table was expanded')
+
+        with mock.patch.object(layer, 'adaln_proj', return_value=(shift, ScaleTable())):
+            actual = final_layer.chunked_final_layer(layer, x, None, *segments, 3)
+        for result, (first, last, row), output in zip(actual, segments, (layer.video_out, layer.audio_out)):
+            expected = output((layer.norm(x[first:last]) * (1 + scale[row]) + shift[row]).float())
+            torch.testing.assert_close(result, expected)
+
+    def test_pdd_weights_are_prepared_once_per_stream(self):
+        layer = _PDDLayer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        args = (
+            layer, x, None, (0, 7, 0), (7, 11, 1), 3,
+            torch.tensor(0.75), torch.tensor([1.0, 0.75, 0.25, 0.0]),
+            (1.0, 2.0),
+        )
+        expected = final_layer.chunked_final_layer(*args)
+        with mock.patch.object(
+            final_layer, '_pdd_weights', wraps=final_layer._pdd_weights,
+        ) as prepare:
+            actual = final_layer.chunked_final_layer(*args)
+        self.assertEqual(prepare.call_count, 2)
+        self.assertIs(prepare.call_args_list[0].args[0], layer.video_out)
+        self.assertIs(prepare.call_args_list[1].args[0], layer.audio_out)
+        for a, b in zip(actual, expected):
+            self.assertTrue(torch.equal(a, b))
+
     def test_empty_stream_matches_stock(self):
         self._assert_matches_stock(((0, 11, 0), (11, 11, 1)))
 

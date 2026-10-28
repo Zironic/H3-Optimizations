@@ -196,8 +196,7 @@ class NormalizedRows:
             return None
         start = int(start)
         stop = int(stop)
-        pieces = []
-        norm_weight = comfy.ops.cast_to_input(self._norm.weight, self._x).contiguous()
+        spans = []
         for seg_start, seg_stop, selector in self._segments:
             lo = max(start, seg_start)
             hi = min(stop, seg_stop)
@@ -205,18 +204,21 @@ class NormalizedRows:
                 continue
             if torch.is_tensor(selector):
                 return None
-            pieces.append(
-                quantize_rms_adaln_int8_rowwise_convrot256(
-                    self._x[lo:hi],
-                    norm_weight,
-                    self._shift[selector].contiguous(),
-                    self._scale[selector].contiguous(),
-                    self._norm.eps,
-                    mode=RMS_ADALN_BF16_STAGED,
-                )
-            )
-        if not pieces:
+            spans.append((lo, hi, selector))
+        if not spans:
             raise RuntimeError('fused Norm1 quantizer received an empty row range')
+        norm_weight = comfy.ops.cast_to_input(self._norm.weight, self._x).contiguous()
+        pieces = [
+            quantize_rms_adaln_int8_rowwise_convrot256(
+                self._x[lo:hi],
+                norm_weight,
+                self._shift[selector].contiguous(),
+                self._scale[selector].contiguous(),
+                self._norm.eps,
+                mode=RMS_ADALN_BF16_STAGED,
+            )
+            for lo, hi, selector in spans
+        ]
         if len(pieces) == 1:
             return pieces[0]
         return (

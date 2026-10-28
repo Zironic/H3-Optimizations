@@ -110,6 +110,47 @@ class MemoryTests(unittest.TestCase):
             torch.bfloat16,
         )
 
+    def test_float_held_mlp_never_produces_a_discarded_carrier(self):
+        x = torch.randn(19, 256, dtype=torch.bfloat16)
+        modulation = torch.zeros(1, 256, dtype=torch.bfloat16)
+        block = SimpleNamespace(
+            norm1=lambda rows: rows.clone(),
+            norm2=lambda rows: rows.clone(),
+            adaln_proj=lambda _t: (modulation,) * 6,
+            attn=lambda rows, **_kwargs: torch.zeros_like(rows),
+        )
+        held = linear_module.HeldMLP(None, x[:1])
+        held.fc1_weight = linear_module.AcquiredLinear(
+            None, torch.empty(512, 256, dtype=torch.bfloat16), None, None,
+        )
+        self.assertFalse(held.supports_prequantized_fc1())
+        with (
+            patch.object(torch.Tensor, 'is_cuda', new_callable=unittest.mock.PropertyMock, return_value=True),
+            patch('h3_optimizations.memory.forward.HeldConvRotINT8Linear.prequantized_is_available', return_value=True),
+            patch('h3_optimizations.memory.forward.rms_adaln_int8_rowwise_convrot256_is_available', return_value=True),
+            patch('h3_optimizations.memory.forward._open_mlp', return_value=(held, 'held', None)),
+            patch('h3_optimizations.memory.forward._quantize_norm_modulation') as quantize,
+            patch('h3_optimizations.memory.forward._run_mlp', side_effect=lambda _b, rows, *_args: (torch.zeros_like(rows), None, 'test')),
+        ):
+            actual = make_forward(
+                block, 0, ActivationMemoryConfig(mode=MODE_BF16, chunk_rows=8),
+                original_forward=lambda *_args: None,
+            )(x.clone(), None, [(0, 19, 0)], None)
+        quantize.assert_not_called()
+        self.assertTrue(torch.equal(actual, x))
+
+    def test_mixed_norm1_selectors_decline_before_any_quantization(self):
+        source = NormalizedRows(
+            torch.ones(8, 256, dtype=torch.bfloat16),
+            SimpleNamespace(weight=torch.ones(256), eps=1e-6),
+            [(0, 4, 0), (4, 8, torch.zeros(4, dtype=torch.long))],
+            torch.zeros(1, 256), torch.zeros(1, 256), lambda *_args: None,
+        )
+        source.enable_fused_convrot_quantization()
+        with patch('h3_optimizations.normalized_rows.quantize_rms_adaln_int8_rowwise_convrot256') as quantize:
+            self.assertIsNone(source.quantize_convrot256(0, 8))
+        quantize.assert_not_called()
+
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(
             chunks.iter_mod_chunks(

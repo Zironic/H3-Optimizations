@@ -139,6 +139,15 @@ class HeldMLP:
         comfy.ops.run_every_op()
         return self.fc1_weight.linear(x)
 
+    def supports_prequantized_fc1(self):
+        if self.fc1_weight.bias is not None:
+            return False
+        try:
+            _convrot_parts(self.fc1_weight.weight, "fc1")
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def fc1_prequantized(self, qdata, scale, out_dtype):
         weight = self.fc1_weight.weight
         if self.fc1_weight.bias is not None:
