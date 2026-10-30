@@ -47,6 +47,43 @@ class CubeOrderTopology:
     forward: tuple
     inverse: tuple
 
+    def order_video_selector(self, video_seg):
+        """Cube-order a raster per-token FinalLayer selector.
+
+        Native ``_forward`` already hands FinalLayer ordered selectors; only a
+        caller that bypassed it, such as a forecast, still holds raster ones.
+        """
+        start, stop, row = video_seg
+        if not torch.is_tensor(row) or row.ndim == 0:
+            return video_seg
+        if int(row.shape[0]) != int(stop) - int(start):
+            raise H3CubeOrderPatchError(
+                "per-token FinalLayer selector does not match the target-video rows"
+            )
+        index = torch.tensor(self.forward, dtype=torch.long, device=row.device)
+        return (start, stop, row.index_select(0, index))
+
+    def restore_video_output(self, output):
+        """Return FinalLayer's projected video rows to raster order."""
+        if not isinstance(output, (list, tuple)) or len(output) != 2:
+            raise H3CubeOrderPatchError(
+                "MiniMax H3 FinalLayer returned an unexpected output contract"
+            )
+        video = output[0]
+        if not torch.is_tensor(video) or video.ndim < 1:
+            raise H3CubeOrderPatchError(
+                "MiniMax H3 FinalLayer returned an invalid video projection"
+            )
+        if int(video.shape[0]) != len(self.inverse):
+            raise H3CubeOrderPatchError(
+                "FinalLayer video projection does not match the cube-order topology"
+            )
+        index = torch.tensor(self.inverse, dtype=torch.long, device=video.device)
+        restored = video.index_select(0, index)
+        if isinstance(output, tuple):
+            return (restored, output[1])
+        return [restored, output[1]]
+
 
 class CubeOrderState:
     """One execution-context topology shared by _forward and FinalLayer."""

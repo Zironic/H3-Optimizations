@@ -135,38 +135,6 @@ def _chunk_count(rows, chunk_rows):
     return (int(rows) + int(chunk_rows) - 1) // int(chunk_rows)
 
 
-def _ordered_selector(video_seg, topology):
-    start, stop, row = video_seg
-    rows = int(stop) - int(start)
-    if not torch.is_tensor(row) or row.ndim == 0:
-        return video_seg
-    if int(row.shape[0]) != rows:
-        raise H3FinalLayerPatchError(
-            'per-token FinalLayer selector does not match the target-video rows'
-        )
-    index = torch.tensor(topology.forward, dtype=torch.long, device=row.device)
-    return (start, stop, row.index_select(0, index))
-
-
-def _restore_video_output(output, topology):
-    if not isinstance(output, (list, tuple)) or len(output) != 2:
-        raise H3FinalLayerPatchError(
-            'MiniMax H3 FinalLayer returned an unexpected output contract'
-        )
-    video = output[0]
-    if not torch.is_tensor(video) or video.ndim < 1:
-        raise H3FinalLayerPatchError(
-            'MiniMax H3 FinalLayer returned an invalid video projection'
-        )
-    if int(video.shape[0]) != len(topology.inverse):
-        raise H3FinalLayerPatchError(
-            'FinalLayer video projection does not match the cube-order topology'
-        )
-    index = torch.tensor(topology.inverse, dtype=torch.long, device=video.device)
-    restored = video.index_select(0, index)
-    return (restored, output[1]) if isinstance(output, tuple) else [restored, output[1]]
-
-
 def make_forward(
     layer,
     chunk_rows=None,
@@ -195,7 +163,7 @@ def make_forward(
         if cube_state is not None:
             topology, active = cube_state.resolve(int(video_seg[1]) - int(video_seg[0]))
             if not active:
-                local_video_seg = _ordered_selector(video_seg, topology)
+                local_video_seg = topology.order_video_selector(video_seg)
 
         if signature is not None:
             if not announced:
@@ -235,7 +203,7 @@ def make_forward(
                 shifts,
             )
 
-        return output if topology is None else _restore_video_output(output, topology)
+        return output if topology is None else topology.restore_video_output(output)
 
     setattr(forward, OWNER_MARKER, True)
     setattr(forward, SIGNATURE_MARKER, signature)
