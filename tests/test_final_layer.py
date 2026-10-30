@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from pathlib import Path
+import inspect
 import sys
 import unittest
 from unittest import mock
@@ -19,6 +20,9 @@ sys.argv = [sys.argv[0], '--cpu']
 import comfy.options  # noqa: E402
 
 comfy.options.enable_args_parsing()
+
+import comfy.ops  # noqa: E402
+from comfy.ldm.minimax import model as minimax  # noqa: E402
 
 from h3_optimizations.memory import final_layer
 from h3_optimizations.cube_order import CubeOrderState, CubeOrderTopology
@@ -125,6 +129,17 @@ class _PDDLayer(_Layer):
         )
 
 
+class _BakedPDDLayer(_PDDLayer):
+    '''ComfyUI 0.42+ builds PDD heads at full width and records video_dim.'''
+
+    video_dim = 3
+
+    def __init__(self):
+        super().__init__()
+        self.video_out.out_features = self.video_out.weight.shape[0]
+        self.audio_out.out_features = self.audio_out.weight.shape[0]
+
+
 class _CurrentIdentityLayer:
     def __init__(self):
         self.received = None
@@ -201,7 +216,12 @@ class FinalLayerTests(unittest.TestCase):
         self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
 
     def test_pdd_head_bank_matches_schedule_weighted_blend(self):
-        layer = _PDDLayer()
+        self._assert_pdd_head_bank_blend(_PDDLayer())
+
+    def test_baked_pdd_head_bank_matches_schedule_weighted_blend(self):
+        self._assert_pdd_head_bank_blend(_BakedPDDLayer())
+
+    def _assert_pdd_head_bank_blend(self, layer):
         x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
         video_seg = (0, 7, 0)
         audio_seg = (7, 11, 1)
@@ -260,6 +280,45 @@ class FinalLayerTests(unittest.TestCase):
                 None,
                 (1.0, 1.0),
             )
+
+    def test_pdd_head_bank_matches_installed_comfy_final_layer(self):
+        if 'sample_sigmas' not in inspect.signature(minimax.FinalLayer.forward).parameters:
+            self.skipTest('installed ComfyUI FinalLayer has no PDD head bank')
+        heads = 4
+        baked = 'pdd_steps' in inspect.signature(minimax.FinalLayer.__init__).parameters
+        torch.manual_seed(0)
+        layer = minimax.FinalLayer(
+            16, 8, 12, 4, 1e-5,
+            operations=comfy.ops.disable_weight_init,
+            **({'pdd_steps': heads} if baked else {}),
+        )
+        for module in layer.modules():
+            for name, value in list(module.named_parameters(recurse=False)):
+                setattr(module, name, torch.nn.Parameter(
+                    torch.randn_like(value) * 0.1, requires_grad=False
+                ))
+        if not baked:
+            # Before ComfyUI 0.42 only a PDD LoRA grows the head rows.
+            for head in (layer.video_out, layer.audio_out):
+                head.weight = torch.nn.Parameter(
+                    torch.randn(head.weight.shape[0] * heads, head.weight.shape[1]) * 0.1,
+                    requires_grad=False,
+                )
+                head.bias = torch.nn.Parameter(
+                    torch.randn(head.bias.shape[0] * heads) * 0.1, requires_grad=False
+                )
+        x = torch.randn(23, 16)
+        t_emb = torch.randn(2, 8)
+        segments = ((0, 13, 0), (13, 20, torch.tensor([0, 1, 1, 0, 1, 0, 0])))
+        sample_sigmas = torch.tensor([1.0, 0.9, 0.7, 0.4, 0.0])
+        forward = final_layer.make_forward(layer, 3)
+        with torch.inference_mode():
+            for sigma in sample_sigmas[:-1]:
+                expected = layer(x, t_emb, *segments, sigma, sample_sigmas, (12.0, 3.0))
+                actual = forward(x, t_emb, *segments, sigma, sample_sigmas, (12.0, 3.0))
+                for want, got in zip(expected, actual):
+                    self.assertEqual(want.shape, got.shape)
+                    self.assertTrue(torch.allclose(want, got, atol=1e-5, rtol=0))
 
     def test_install_is_owned_and_idempotent(self):
         patcher = _Patcher()

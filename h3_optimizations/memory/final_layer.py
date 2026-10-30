@@ -65,7 +65,11 @@ def chunked_final_layer(
 ):
     shift, scale = layer.adaln_proj(t_emb)
 
-    n = layer.video_out.weight.shape[0] // layer.video_out.out_features
+    # ComfyUI 0.42+ sizes baked PDD heads at full width and records video_dim;
+    # older layers only grow PDD rows past out_features through a PDD LoRA.
+    n = layer.video_out.weight.shape[0] // getattr(
+        layer, 'video_dim', layer.video_out.out_features
+    )
     pdd = None
     if n > 1:
         if sample_sigmas is None:
