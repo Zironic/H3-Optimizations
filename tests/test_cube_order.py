@@ -1,6 +1,5 @@
 """CPU contracts for H3-owned cube-major token ordering."""
 
-import inspect
 import os
 from pathlib import Path
 import sys
@@ -60,24 +59,6 @@ def _raster_video(t, h, w):
     return torch.arange(t * h * w, dtype=torch.float32).reshape(1, 1, t, h, w)
 
 
-def _packed_layout_supports(name):
-    return name in inspect.signature(PackedLayout).parameters
-
-
-def _compatible_keyframe(frame_count):
-    # v0.33 only accepts first/last anchors; v0.34 generalized PackedLayout to
-    # arbitrary keyframe positions. Exercise the broader contract where it
-    # exists without feeding an impossible layout to the older release.
-    return 2 if not _packed_layout_supports("frame_count") else frame_count - 1
-
-
-def _packed_layout(*args, keyframes=None, refs=None, frame_count=None):
-    kwargs = {"keyframes": keyframes, "refs": refs}
-    if _packed_layout_supports("frame_count"):
-        kwargs["frame_count"] = frame_count
-    return PackedLayout(*args, **kwargs)
-
-
 class _FakePatcher:
     def __init__(self, model):
         self.model = model
@@ -99,7 +80,8 @@ class _FakePatcher:
 
 class _PassthroughFinalLayer:
     @staticmethod
-    def forward(x, _t_emb, video_seg, audio_seg):
+    def forward(x, _t_emb, video_seg, audio_seg, _sigma=None,
+                _sample_sigmas=None, _shifts=None):
         return x[video_seg[0]:video_seg[1]], x[audio_seg[0]:audio_seg[1]]
 
 
@@ -266,9 +248,8 @@ class CubeOrderTests(unittest.TestCase):
             dtype=torch.float32,
         )
         padded_video = common_dit.pad_to_patch_size(video, patch_size)
-        frame_count = 5
         keyframes = [{
-            "resolved_frame_index": _compatible_keyframe(frame_count),
+            "resolved_frame_index": 2,
             "latent": torch.zeros(1, 24, 1, 34, 18),
             "audio_latent": torch.zeros(1, 32, 2, 2),
         }]
@@ -283,7 +264,7 @@ class CubeOrderTests(unittest.TestCase):
                 "ref_audio_t": 2,
             },
         ]
-        base_layout = _packed_layout(
+        base_layout = PackedLayout(
             context.shape[1],
             padded_video.shape[2],
             padded_video.shape[3],
@@ -291,14 +272,12 @@ class CubeOrderTests(unittest.TestCase):
             audio.shape[-1],
             keyframes=keyframes,
             refs=refs,
-            frame_count=frame_count,
         )
         original_position_ids = base_layout.position_ids.clone()
         payload = {
             "layout": base_layout,
             "keyframes": keyframes,
             "refs": refs,
-            "frame_count": frame_count,
             "sentinel": object(),
         }
         transformer_options = {"sentinel": object()}
@@ -407,10 +386,8 @@ class CubeOrderTests(unittest.TestCase):
         video = _raster_video(5, 34, 18)
         audio = torch.zeros(1, 32, 2, 3)
         context = torch.zeros(1, 3, 8)
-        frame_count = 5
-        keyframe_index = _compatible_keyframe(frame_count)
         keyframes = [{
-            "resolved_frame_index": keyframe_index,
+            "resolved_frame_index": 2,
             "latent": torch.zeros(1, 24, 1, 34, 18),
             "audio_latent": torch.zeros(1, 32, 2, 2),
         }]
@@ -426,10 +403,7 @@ class CubeOrderTests(unittest.TestCase):
             torch.tensor([500.0]),
             context,
             {},
-            minimax_payload={
-                "keyframes": keyframes,
-                "frame_count": frame_count,
-            },
+            minimax_payload={"keyframes": keyframes},
         )
 
         self.assertTrue(torch.equal(output[0], video))
@@ -437,14 +411,13 @@ class CubeOrderTests(unittest.TestCase):
         cond_start, _cond_stop, _kind = next(
             segment for segment in layout.segments if segment[2] == "cond"
         )
-        expected = _packed_layout(
+        expected = PackedLayout(
             context.shape[1],
             video.shape[2],
             video.shape[3],
             video.shape[4],
             audio.shape[-1],
             keyframes=keyframes,
-            frame_count=frame_count,
         )
         self.assertTrue(torch.equal(
             layout.position_ids[cond_start],
@@ -485,28 +458,26 @@ class CubeOrderTests(unittest.TestCase):
             },
         )
 
-    def test_clear_exposes_inner_embedding_wrapper_for_plan_rebuild(self):
+    def test_clear_exposes_inner_forward_wrapper_for_plan_rebuild(self):
         model = _model()
         patcher = _FakePatcher(model)
-        first_embedding = lambda *args, **kwargs: None
-        first_embedding._h3_optimizations_embedding_memory = True
-        patcher.object_patches[FORWARD_KEY] = first_embedding
+        first_wrapper = lambda *args, **kwargs: None
+        patcher.object_patches[FORWARD_KEY] = first_wrapper
 
         self.assertTrue(install(patcher, (1, 8, 8)))
         self.assertIs(
             patcher.object_patches[FORWARD_KEY]._h3_cube_order_original,
-            first_embedding,
+            first_wrapper,
         )
         self.assertTrue(clear(patcher))
-        self.assertIs(patcher.object_patches[FORWARD_KEY], first_embedding)
+        self.assertIs(patcher.object_patches[FORWARD_KEY], first_wrapper)
 
-        second_embedding = lambda *args, **kwargs: None
-        second_embedding._h3_optimizations_embedding_memory = True
-        patcher.object_patches[FORWARD_KEY] = second_embedding
+        second_wrapper = lambda *args, **kwargs: None
+        patcher.object_patches[FORWARD_KEY] = second_wrapper
         self.assertTrue(install(patcher, (4, 4, 4)))
         self.assertIs(
             patcher.object_patches[FORWARD_KEY]._h3_cube_order_original,
-            second_embedding,
+            second_wrapper,
         )
 
     def test_clear_removes_wrapper_when_it_wraps_stock_forward(self):

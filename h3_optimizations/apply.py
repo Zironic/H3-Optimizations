@@ -76,10 +76,6 @@ from .memory.fused_residual import (
     unavailable_reason as fused_residual_unavailable_reason,
 )
 from .memory.final_layer import install as install_final_layer
-from .memory.embedding import clear as clear_embedding_memory
-from .memory.embedding import install as install_embedding_memory
-from .memory.embedding import is_installed as is_embedding_memory_installed
-from .memory.embedding import released_by_comfy as embedding_released_by_comfy
 from .memory.patch import install as install_memory_patch
 from .model import get_h3_blocks, is_minimax_h3
 from .patch import clear_backend, configure_backend
@@ -91,8 +87,6 @@ from .plan import (
     FUSED_QKV_FORCE_QUANT,
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
-    EMBEDDING_MEMORY_RELEASE,
-    EMBEDDING_MEMORY_STOCK,
     H3OptimizationPlan,
     V_MEMORY_RETAIN,
     PLAN_KEY,
@@ -1158,15 +1152,8 @@ def _install_mlp(
 ):
     memory = plan.memory
     if memory is None:
-        clear_embedding_memory(model_patcher)
         return resolve_mlp_provider(inventory, request='off'), 0
     rebuild_kwargs = {'force_rebuild': True} if force_rebuild else {}
-    if memory.embedding_memory == EMBEDDING_MEMORY_STOCK:
-        clear_embedding_memory(model_patcher)
-    elif memory.embedding_memory == EMBEDDING_MEMORY_RELEASE:
-        install_embedding_memory(model_patcher, strict=True, **rebuild_kwargs)
-    else:
-        install_embedding_memory(model_patcher, **rebuild_kwargs)
     install_final_layer(
         model_patcher,
         int(memory.chunk_rows),
@@ -1250,7 +1237,6 @@ def _status(
     mlp_blocks,
     runtime_installed,
     inventory,
-    embedding_memory_selected,
     canonical_quantization,
 ):
     return {
@@ -1345,14 +1331,6 @@ def _status(
             else {
                 'chunked': True,
                 'chunk_rows': int(plan.memory.chunk_rows),
-            }
-        ),
-        'embedding_memory': (
-            None
-            if plan.memory is None
-            else {
-                'requested': plan.memory.embedding_memory,
-                'selected': embedding_memory_selected,
             }
         ),
         'weight_formats': _inventory_status(inventory),
@@ -1570,12 +1548,6 @@ def _reconcile_plan(
         environment,
         **rebuild_kwargs,
     )
-    if is_embedding_memory_installed(patched):
-        embedding_memory_selected = 'release'
-    elif embedding_released_by_comfy(patched):
-        embedding_memory_selected = 'comfy_release'
-    else:
-        embedding_memory_selected = 'stock'
     if plan.sparse is not None:
         cube_shape = TOKEN_ORDER_SHAPES[plan.sparse.video_token_order]
         if cube_shape is not None:
@@ -1605,7 +1577,6 @@ def _reconcile_plan(
         mlp_blocks=mlp_blocks,
         runtime_installed=runtime_installed,
         inventory=inventory,
-        embedding_memory_selected=embedding_memory_selected,
         canonical_quantization=patched.model_options.get(CANONICAL_QUANT_KEY),
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
@@ -1621,10 +1592,6 @@ def _reconcile_plan(
         )),
         'final_layer': bool(options.get(
             'h3_optimizations_preserved_final_layer_patch',
-            False,
-        )),
-        'embedding': bool(options.get(
-            'h3_optimizations_preserved_embedding_patch',
             False,
         )),
     }
@@ -1665,10 +1632,6 @@ def _reconcile_plan(
                     plan.memory is not None
                     and not preserved['final_layer']
                 )
-                or (
-                    embedding_memory_selected == 'release'
-                    and not preserved['embedding']
-                )
             )
         ),
     }
@@ -1694,7 +1657,7 @@ def _reconcile_plan(
         else ''
     )
     logging.debug(
-        '%s applied plan: phase=%s features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s embedding=%s memory=%s device=%s',
+        '%s applied plan: phase=%s features=%s attention=%s%s qkv="%s" qkv_provider=%s qkv_weights=%s qkv_layers=%d out_proj=%s mlp=%s memory=%s device=%s',
         LOG_PREFIX,
         phase,
         features,
@@ -1712,7 +1675,6 @@ def _reconcile_plan(
             else 'checkpoint_native'
         ),
         mlp.provider_id,
-        embedding_memory_selected,
         describe_memory_options(attention),
         environment.device_name,
     )

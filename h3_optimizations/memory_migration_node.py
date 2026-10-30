@@ -12,9 +12,6 @@ from .node_constants import DEFAULT_CHUNK_ROWS, NODE_CATEGORY
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
-    EMBEDDING_MEMORY_AUTO,
-    EMBEDDING_MEMORY_RELEASE,
-    EMBEDDING_MEMORY_STOCK,
     FUSED_QKV_AUTO,
     FUSED_QKV_FORCE_BF16,
     FUSED_QKV_FORCE_QUANT,
@@ -146,9 +143,8 @@ def _memory_request_for_modes(
         else mlp_memory
     )
 
-    # Serialized compatibility slot from 0.2.21. Auto releases compatible
-    # embedding implementations early and preserves the stock lifetime for
-    # unrecognized implementations.
+    # Serialized compatibility slot from 0.2.21. ComfyUI 0.39 and newer release
+    # the embedding assembly tensors before block 0 themselves.
     del embedding_memory_mode
 
     v_memory_requests = {
@@ -172,7 +168,6 @@ def _memory_request_for_modes(
             PRECISION_MODE_BF16,
             PRECISION_MODE_FORCE_QUANT,
         ),
-        embedding_memory=EMBEDDING_MEMORY_AUTO,
         attention_v_memory=v_memory_request,
     )
 
@@ -310,8 +305,8 @@ class H3MemoryOptimization(io.ComfyNode):
                         'hidden': True,
                         'tooltip': (
                             'Legacy serialized workflow slot. The value is ignored; '
-                            'compatible embedding assembly tensors are released early, '
-                            'otherwise ComfyUI\'s stock lifetime is preserved.'
+                            'ComfyUI releases the embedding assembly tensors before '
+                            'block 0.'
                         ),
                     },
                 ),

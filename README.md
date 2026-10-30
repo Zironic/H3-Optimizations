@@ -29,8 +29,9 @@ Example comparisons are available in the
 
 ## Install
 
-The package requires **ComfyUI 0.33.0 or newer** and is intended for installation
-through ComfyUI-Manager.
+The package requires **ComfyUI 0.40.0 or newer** and is intended for installation
+through ComfyUI-Manager. On ComfyUI 0.33 through 0.39, install H3 Optimizations
+0.2.47; newer releases load no nodes there and log why.
 
 For a manual installation, run this from ComfyUI's `custom_nodes` directory:
 
@@ -77,10 +78,7 @@ Choose **Lower VRAM (slower)** only when you need to reduce the peak further.
 The **Activation chunk rows** control trades temporary memory for throughput;
 the default is the normal recommendation.
 
-Embedding assembly tensors are released before block 0. ComfyUI 0.39.2 and
-newer do this themselves; on older recognized versions the node does it.
-Unrecognized implementations retain ComfyUI's normal embedding lifetime instead
-of failing the workflow.
+ComfyUI releases the embedding assembly tensors before block 0 itself.
 
 This node is different from Sparse Attention: it changes how the work is
 executed and stored rather than intentionally removing video attention
@@ -170,7 +168,7 @@ these numbers.
 
 ## Compatibility at a glance
 
-- ComfyUI 0.33.0 or newer with MiniMax H3 support
+- ComfyUI 0.40.0 or newer with MiniMax H3 support
 - Python 3.10 or newer
 - Windows x64 or Linux x86-64 for the shipped native Kitchen binaries
 - NVIDIA SM75 or newer for the shipped native Kitchen path
@@ -521,7 +519,7 @@ callable `consume` is an error. Unmarked overrides retain full-Q behavior.
 
 ### Detailed requirements and architecture support
 
-- ComfyUI 0.33.0+ with MiniMax H3 and `comfy_api.latest`
+- ComfyUI 0.40.0+ with MiniMax H3 and `comfy_api.latest`
 - Python 3.10+
 - Linux glibc 2.34+ and `GLIBCXX_3.4.21`+ for the shipped Linux native binary
 - Any ComfyUI-supported MiniMax H3 backend for the final dense fallback

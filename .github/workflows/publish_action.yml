@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        comfy-ref: ["v0.33.0", "v0.34.0", "v0.41.3"]
+        comfy-ref: ["v0.40.0", "v0.43.2"]
         python-version: ["3.10", "3.12"]
     steps:
       - name: Check out ComfyUI ${{ matrix.comfy-ref }}

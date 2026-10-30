@@ -1,8 +1,26 @@
 '''ComfyUI entry point for H3 Optimizations.'''
 
 from importlib import util as importlib_util
+import logging
 from pathlib import Path
+import re
 import sys
+
+
+# Keep in step with requires-comfyui in pyproject.toml.
+MINIMUM_COMFYUI = (0, 40, 0)
+LAST_RELEASE_FOR_OLDER_COMFYUI = '0.2.47'
+
+
+def _unsupported_comfyui_version():
+    '''Return the installed ComfyUI version when it is older than the floor.'''
+    try:
+        from comfyui_version import __version__
+    except ImportError:
+        return None
+    if tuple(int(part) for part in re.findall(r'\d+', __version__)[:3]) < MINIMUM_COMFYUI:
+        return __version__
+    return None
 
 
 def _load_h3_package():
@@ -45,10 +63,21 @@ def _load_h3_package():
     return h3_optimizations
 
 
-_h3_optimizations = _load_h3_package()
+_old_comfyui = _unsupported_comfyui_version()
+if _old_comfyui is not None:
+    logging.error(
+        '[H3 Optimizations] needs ComfyUI %s or newer, found %s; no H3 '
+        'Optimizations nodes were loaded. Update ComfyUI, or install H3 '
+        'Optimizations %s for older versions.',
+        '.'.join(map(str, MINIMUM_COMFYUI)),
+        _old_comfyui,
+        LAST_RELEASE_FOR_OLDER_COMFYUI,
+    )
+    NODE_CLASS_MAPPINGS = {}
+else:
+    _h3_optimizations = _load_h3_package()
 
-from h3_optimizations.public_nodes import H3OptimizationsExtension
+    from h3_optimizations.public_nodes import H3OptimizationsExtension
 
-
-async def comfy_entrypoint() -> H3OptimizationsExtension:
-    return H3OptimizationsExtension()
+    async def comfy_entrypoint() -> H3OptimizationsExtension:
+        return H3OptimizationsExtension()

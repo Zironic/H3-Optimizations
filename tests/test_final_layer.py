@@ -27,11 +27,7 @@ from comfy.ldm.minimax import model as minimax  # noqa: E402
 from h3_optimizations.memory import final_layer
 from h3_optimizations.cube_order import CubeOrderState, CubeOrderTopology
 import h3_optimizations.apply as apply_module
-from h3_optimizations.plan import (
-    EMBEDDING_MEMORY_RELEASE,
-    H3OptimizationPlan,
-    MemoryRequest,
-)
+from h3_optimizations.plan import H3OptimizationPlan, MemoryRequest
 from h3_optimizations.qkv.providers import MLPProviderResolution
 from comfy.model_patcher import ModelPatcher
 
@@ -190,15 +186,6 @@ class FinalLayerTests(unittest.TestCase):
     def test_empty_stream_matches_stock(self):
         self._assert_matches_stock(((0, 11, 0), (11, 11, 1)))
 
-    def test_forward_supports_legacy_four_argument_contract(self):
-        layer = _Layer()
-        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
-        segments = ((0, 7, 0), (7, 11, 1))
-        expected = layer.forward(x, None, *segments)
-        actual = final_layer.make_forward(layer, 3)(x, None, *segments)
-        self.assertTrue(torch.allclose(expected[0], actual[0], atol=1e-4, rtol=0))
-        self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
-
     def test_forward_supports_current_seven_argument_contract(self):
         layer = _Layer()
         x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
@@ -282,8 +269,6 @@ class FinalLayerTests(unittest.TestCase):
             )
 
     def test_pdd_head_bank_matches_installed_comfy_final_layer(self):
-        if 'sample_sigmas' not in inspect.signature(minimax.FinalLayer.forward).parameters:
-            self.skipTest('installed ComfyUI FinalLayer has no PDD head bank')
         heads = 4
         baked = 'pdd_steps' in inspect.signature(minimax.FinalLayer.__init__).parameters
         torch.manual_seed(0)
@@ -481,8 +466,6 @@ class FinalLayerTests(unittest.TestCase):
         with mock.patch.object(
             apply_module, 'install_final_layer'
         ) as install, mock.patch.object(
-            apply_module, 'install_embedding_memory'
-        ) as install_embedding, mock.patch.object(
             apply_module, 'resolve_mlp_provider', return_value=disabled
         ):
             resolution, patched_blocks = apply_module._install_mlp(
@@ -490,29 +473,8 @@ class FinalLayerTests(unittest.TestCase):
             )
 
         install.assert_called_once_with(patcher, 4096)
-        install_embedding.assert_called_once_with(patcher)
         self.assertIs(resolution, disabled)
         self.assertEqual(patched_blocks, 0)
-
-    def test_explicit_embedding_release_is_strict(self):
-        patcher = _Patcher()
-        plan = H3OptimizationPlan(
-            memory=MemoryRequest(
-                mlp_memory='off',
-                embedding_memory=EMBEDDING_MEMORY_RELEASE,
-            )
-        )
-        disabled = MLPProviderResolution('off', 'off', 'disabled')
-        with mock.patch.object(
-            apply_module, 'install_final_layer'
-        ), mock.patch.object(
-            apply_module, 'install_embedding_memory'
-        ) as install_embedding, mock.patch.object(
-            apply_module, 'resolve_mlp_provider', return_value=disabled
-        ):
-            apply_module._install_mlp(patcher, plan, object(), object())
-
-        install_embedding.assert_called_once_with(patcher, strict=True)
 
 
 if __name__ == '__main__':

@@ -46,7 +46,8 @@ class _IdentityLayer(torch.nn.Module):
         super().__init__()
         self.video_selector = None
 
-    def forward(self, x, _t_emb, video_seg, audio_seg):
+    def forward(self, x, _t_emb, video_seg, audio_seg, _sigma=None,
+                _sample_sigmas=None, _shifts=None):
         self.video_selector = video_seg[2]
         return x[video_seg[0]:video_seg[1]], x[audio_seg[0]:audio_seg[1]]
 

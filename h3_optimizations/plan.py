@@ -86,14 +86,6 @@ SPARSE_BACKEND_REQUESTS = (
     SPARSE_BACKEND_KITCHEN_64X32,
 )
 
-EMBEDDING_MEMORY_AUTO = 'auto'
-EMBEDDING_MEMORY_STOCK = 'stock'
-EMBEDDING_MEMORY_RELEASE = 'release'
-EMBEDDING_MEMORY_REQUESTS = (
-    EMBEDDING_MEMORY_AUTO,
-    EMBEDDING_MEMORY_STOCK,
-    EMBEDDING_MEMORY_RELEASE,
-)
 
 V_MEMORY_RETAIN = 'retain'
 V_MEMORY_TWO_PASS = 'two_pass'
@@ -191,7 +183,6 @@ class MemoryRequest:
     qkv_streaming: str = QKV_STREAMING_AUTO
     prefer_held_weights: bool = True
     mlp_strict: bool = False
-    embedding_memory: str = EMBEDDING_MEMORY_AUTO
     attention_v_memory: str = V_MEMORY_RETAIN
 
     def __post_init__(self):
@@ -220,10 +211,6 @@ class MemoryRequest:
             raise ValueError('unknown fused QKV request %r' % self.fused_qkv)
         if self.mlp_memory not in MLP_MEMORY_REQUESTS:
             raise ValueError('unknown MLP memory request %r' % self.mlp_memory)
-        if self.embedding_memory not in EMBEDDING_MEMORY_REQUESTS:
-            raise ValueError(
-                'unknown embedding memory request %r' % self.embedding_memory
-            )
         if self.attention_v_memory not in V_MEMORY_REQUESTS:
             raise ValueError(
                 'unknown attention V memory request %r' % self.attention_v_memory
@@ -246,7 +233,6 @@ class MemoryRequest:
             self.qkv_streaming,
             bool(self.prefer_held_weights),
             bool(self.mlp_strict),
-            self.embedding_memory,
             self.attention_v_memory,
         )
 

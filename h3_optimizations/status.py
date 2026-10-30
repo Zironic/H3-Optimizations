@@ -267,8 +267,7 @@ def _composition_lines(status):
     attention = len(preserved.get('attention') or ())
     blocks = len(preserved.get('blocks') or ())
     final_layer = bool(preserved.get('final_layer'))
-    embedding = bool(preserved.get('embedding'))
-    if attention or blocks or final_layer or embedding:
+    if attention or blocks or final_layer:
         details = []
         if attention:
             details.append('%d attention' % attention)
@@ -276,8 +275,6 @@ def _composition_lines(status):
             details.append('%d block' % blocks)
         if final_layer:
             details.append('FinalLayer')
-        if embedding:
-            details.append('embedding _forward')
         lines.append(
             'Composition: preserved foreign object patches (%s); conflicting '
             'H3 sub-optimizations are disabled.'
@@ -295,7 +292,6 @@ def format_memory_status(model):
     qkv = status.get('fused_qkv', {})
     mlp = status.get('mlp', {})
     final_layer = status.get('final_layer') or {}
-    embedding_memory = status.get('embedding_memory') or {}
     lines = [
         'Attention: %s' % (attention.get('selected') or 'preserve incoming'),
         'QKV: %s' % format_qkv_execution(status),
@@ -330,12 +326,6 @@ def format_memory_status(model):
             index for index, line in enumerate(lines) if line.startswith('MLP:')
         )
         lines[mlp_index] += ' (%d-row chunks)' % int(chunk_rows)
-    if embedding_memory.get('selected') == 'release':
-        lines.append('Embedding memory: released before block 0')
-    elif embedding_memory.get('selected') == 'comfy_release':
-        lines.append('Embedding memory: released before block 0 by ComfyUI')
-    elif embedding_memory.get('selected') == 'stock':
-        lines.append('Embedding memory: stock lifetime')
     v_memory_notice = _v_memory_notice(qkv)
     if v_memory_notice is not None:
         lines.append(v_memory_notice)

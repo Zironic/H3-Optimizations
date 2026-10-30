@@ -1,6 +1,5 @@
 '''Bounded MiniMax H3 FinalLayer execution.'''
 
-import inspect
 import logging
 
 import torch
@@ -16,7 +15,6 @@ OWNER_MARKER = '_h3_optimizations_final_layer'
 SIGNATURE_MARKER = '_h3_optimizations_final_layer_signature'
 ORIGINAL_MARKER = '_h3_optimizations_final_layer_original'
 CUBE_STATE_MARKER = '_h3_optimizations_cube_order_state'
-_CURRENT_FORWARD_PARAMETERS = frozenset({'sigma', 'sample_sigmas', 'shifts'})
 
 
 class H3FinalLayerPatchError(RuntimeError):
@@ -132,39 +130,6 @@ def _chunk_count(rows, chunk_rows):
     return (int(rows) + int(chunk_rows) - 1) // int(chunk_rows)
 
 
-def _accepts_current_contract(forward):
-    parameters = inspect.signature(forward).parameters.values()
-    if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
-        return True
-    return _CURRENT_FORWARD_PARAMETERS.issubset(
-        parameter.name for parameter in parameters
-    )
-
-
-def _call_original(
-    original_forward,
-    current_contract,
-    x,
-    t_emb,
-    video_seg,
-    audio_seg,
-    sigma,
-    sample_sigmas,
-    shifts,
-):
-    if current_contract:
-        return original_forward(
-            x,
-            t_emb,
-            video_seg,
-            audio_seg,
-            sigma,
-            sample_sigmas,
-            shifts,
-        )
-    return original_forward(x, t_emb, video_seg, audio_seg)
-
-
 def _ordered_selector(video_seg, topology):
     start, stop, row = video_seg
     rows = int(stop) - int(start)
@@ -208,7 +173,6 @@ def make_forward(
     if signature is not None and signature <= 0:
         raise ValueError('chunk_rows must be positive')
     original_forward = original_forward or layer.forward
-    current_contract = _accepts_current_contract(original_forward)
     announced = []
 
     def forward(
@@ -256,9 +220,7 @@ def make_forward(
                 shifts,
             )
         else:
-            output = _call_original(
-                original_forward,
-                current_contract,
+            output = original_forward(
                 x,
                 t_emb,
                 local_video_seg,

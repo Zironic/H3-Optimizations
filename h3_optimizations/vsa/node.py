@@ -9,8 +9,6 @@ composes with H3 Memory Optimization's block forward.
 
 from __future__ import annotations
 
-import contextlib
-import inspect
 import logging
 import re
 
@@ -18,7 +16,7 @@ from comfy_api.latest import io
 
 import comfy.model_prefetch
 import comfy.patcher_extension
-from comfy.ldm.minimax.model import DiTBlock, MiniMaxH3Model
+from comfy.ldm.minimax.model import MiniMaxH3Model
 
 from ..node_constants import NODE_CATEGORY
 import torch
@@ -117,8 +115,7 @@ def parse_block_list(text):
 
 
 def _pause_compiler():
-    pause = getattr(comfy.model_prefetch, 'pause_malloc_graph', None)
-    return pause() if pause is not None else contextlib.nullcontext()
+    return comfy.model_prefetch.pause_malloc_graph()
 
 
 class VSAState:
@@ -226,11 +223,6 @@ def apply_vsa(model, keep_percent, dense_first_steps=0, dense_layers='', verbose
             'H3 VSA Attention needs a VSA-trained MiniMax H3 checkpoint (one with '
             'to_gate_compress layers, such as FastH3). Use H3 Sparse Attention for '
             'the base model.'
-        )
-    if 'attention' not in inspect.signature(DiTBlock.forward).parameters:
-        raise RuntimeError(
-            'H3 VSA Attention needs a ComfyUI whose H3 blocks accept an attention '
-            'replacement (0.35 or newer)'
         )
     state = VSAState(
         sparsity=sparsity_from_keep_percent(keep_percent),

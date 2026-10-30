@@ -10,8 +10,6 @@ sys.path.insert(0, str(PACK))
 
 from h3_optimizations.plan import (  # noqa: E402
     ATTENTION_EXISTING,
-    EMBEDDING_MEMORY_AUTO,
-    EMBEDDING_MEMORY_RELEASE,
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_RAMP,
     FUSED_QKV_OFF,
@@ -45,14 +43,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(request.chunk_rows, 4096)
         self.assertTrue(request.prefer_held_weights)
         self.assertFalse(request.mlp_strict)
-        self.assertEqual(request.embedding_memory, EMBEDDING_MEMORY_AUTO)
         self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_RETAIN)
-
-    def test_embedding_memory_is_part_of_memory_identity(self):
-        request = MemoryRequest(embedding_memory=EMBEDDING_MEMORY_RELEASE)
-        self.assertIn(EMBEDDING_MEMORY_RELEASE, request.signature)
-        with self.assertRaisesRegex(ValueError, 'embedding memory'):
-            MemoryRequest(embedding_memory='unknown')
 
     def test_attention_v_memory_is_explicit_and_part_of_identity(self):
         request = MemoryRequest(attention_v_memory=KITCHEN_V_MEMORY_TWO_PASS)
