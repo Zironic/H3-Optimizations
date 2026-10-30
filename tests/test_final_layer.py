@@ -183,6 +183,100 @@ class FinalLayerTests(unittest.TestCase):
             (7, 11, torch.tensor([1, 0, 0, 1])),
         ))
 
+    def test_per_token_modulation_is_gathered_per_chunk(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = (
+            (0, 7, torch.tensor([0, 1, 0, 1, 1, 0, 1])),
+            (7, 11, torch.tensor([1, 0, 0, 1])),
+        )
+        expected = layer.forward(x, None, *segments)
+        gathered = []
+
+        class Table:
+            def __init__(self, values):
+                self.values = values
+
+            def __getitem__(self, index):
+                gathered.append(int(index.numel()))
+                return self.values[index]
+
+        tables = tuple(Table(value) for value in layer.adaln_proj(None))
+        with mock.patch.object(layer, 'adaln_proj', return_value=tables):
+            actual = final_layer.chunked_final_layer(
+                layer, x, None, *segments, chunk_rows=3
+            )
+        # Two tables, chunks of 3+3+1 and 3+1 rows: never a whole stream.
+        self.assertEqual(gathered, [3, 3, 3, 3, 1, 1, 3, 3, 1, 1])
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=0)
+
+    def test_matches_core_final_layer_for_every_selector_kind(self):
+        # The fakes above mirror core by hand; this pins the real module so a
+        # core change to selector semantics fails here, not in a masked run.
+        import comfy.ops
+        from comfy.ldm.minimax.model import FinalLayer
+
+        torch.manual_seed(7)
+        layer = FinalLayer(
+            32, 24, 6, 4, 1e-6, dtype=torch.float32, device='cpu',
+            operations=comfy.ops.disable_weight_init,
+        )
+        for parameter in layer.parameters():
+            parameter.detach().copy_(torch.randn_like(parameter) * 0.1)
+        x = torch.randn(20, 32)
+        t_emb = torch.randn(3, 24)
+        cases = {
+            'scalar': ((0, 13, 1), (13, 20, 2)),
+            'per_token': ((0, 13, torch.randint(0, 3, (13,))), (13, 20, 2)),
+            'both_per_token': (
+                (0, 13, torch.randint(0, 3, (13,))),
+                (13, 20, torch.randint(0, 3, (7,))),
+            ),
+            'empty_audio': ((0, 20, torch.randint(0, 3, (20,))), (20, 20, 0)),
+        }
+        for name, segments in cases.items():
+            with self.subTest(name):
+                expected = layer.forward(x, t_emb, *segments, None, None, None)
+                actual = final_layer.chunked_final_layer(
+                    layer, x, t_emb, *segments, chunk_rows=5,
+                )
+                for a, b in zip(actual, expected):
+                    self.assertEqual(a.shape, b.shape)
+                    torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+
+    def test_chunked_streams_do_not_concatenate(self):
+        layer = _Layer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        segments = ((0, 7, 0), (7, 11, 1))
+        expected = layer.forward(x, None, *segments)
+        with mock.patch.object(torch, 'cat', side_effect=AssertionError('cat')):
+            actual = final_layer.chunked_final_layer(
+                layer, x, None, *segments, chunk_rows=3
+            )
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=0)
+
+    def test_pdd_head_is_blended_once_per_stream(self):
+        layer = _PDDLayer()
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        args = (
+            layer, x, None, (0, 7, 0), (7, 11, 1), 3,
+            torch.tensor(0.75), torch.tensor([1.0, 0.75, 0.25, 0.0]),
+            (1.0, 2.0),
+        )
+        single = final_layer.chunked_final_layer(*args[:5], 11, *args[6:])
+        with mock.patch.object(
+            final_layer, '_pdd_weights', wraps=final_layer._pdd_weights,
+        ) as blend:
+            chunked = final_layer.chunked_final_layer(*args)
+        self.assertEqual(
+            [call.args[0] for call in blend.call_args_list],
+            [layer.video_out, layer.audio_out],
+        )
+        for a, b in zip(chunked, single):
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=0)
+
     def test_empty_stream_matches_stock(self):
         self._assert_matches_stock(((0, 11, 0), (11, 11, 1)))
 

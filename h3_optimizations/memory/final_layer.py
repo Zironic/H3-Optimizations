@@ -21,11 +21,8 @@ class H3FinalLayerPatchError(RuntimeError):
     pass
 
 
-def _selector(value, start, stop):
-    return value if value.ndim == 1 else value[start:stop]
-
-
-def _pdd_head(head, value, n, start, stop, flow_shift):
+def _pdd_weights(head, value, n, start, stop, flow_shift):
+    '''Blend the PDD head bank into the one head this step consumes.'''
     grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
     dt = (
         1.0 - flow_shift * grid / (1.0 + (flow_shift - 1.0) * grid)
@@ -37,8 +34,7 @@ def _pdd_head(head, value, n, start, stop, flow_shift):
         rows = weight.reshape(n, -1, weight.shape[1])
         bias_rows = bias.reshape(n, -1)
         first = max(start, 1)
-        return torch.nn.functional.linear(
-            value,
+        return (
             rows[0]
             + torch.einsum(
                 'n,noi->oi', blend[first - start:], rows[first:stop]
@@ -86,35 +82,44 @@ def chunked_final_layer(
 
     def project(segment, output, flow_shift=None):
         first, last, row = segment
-        selected_shift = shift[row]
-        selected_scale = scale[row]
-        pieces = []
-        for start in range(first, last, int(chunk_rows)):
-            stop = min(start + int(chunk_rows), last)
-            local_start = start - first
-            local_stop = stop - first
-            value = (
-                layer.norm(x[start:stop])
-                * (1.0 + _selector(selected_scale, local_start, local_stop))
-                + _selector(selected_shift, local_start, local_stop)
-            ).to(torch.float32)
-            pieces.append(
-                output(value)
-                if pdd is None
-                else _pdd_head(output, value, *pdd, flow_shift)
-            )
-        if not pieces:
-            value = (
-                layer.norm(x[first:last])
-                * (1.0 + _selector(selected_scale, 0, 0))
-                + _selector(selected_shift, 0, 0)
-            ).to(torch.float32)
-            return (
-                output(value)
-                if pdd is None
-                else _pdd_head(output, value, *pdd, flow_shift)
-            )
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        step = int(chunk_rows)
+        per_token = torch.is_tensor(row) and row.ndim > 0
+        if not per_token:
+            row_scale = 1.0 + scale[row]
+            row_shift = shift[row]
+        head = None
+        result = None
+        # An empty stream still runs once so its output keeps the stock shape.
+        for start in range(first, max(last, first + 1), step):
+            stop = min(start + step, last)
+            if per_token:
+                # A masked stream selects one modulation row per token. Gather
+                # per chunk: a whole-stream gather is two [rows, hidden] tables.
+                local = row[start - first:stop - first]
+                row_scale = 1.0 + scale[local]
+                row_shift = shift[local]
+            value = layer.norm(x[start:stop]) * row_scale
+            if per_token:
+                del row_scale
+            value = (value + row_shift).to(torch.float32)
+            if per_token:
+                del row_shift
+            if pdd is None:
+                projected = output(value)
+            else:
+                if head is None:
+                    head = _pdd_weights(output, value, *pdd, flow_shift)
+                projected = torch.nn.functional.linear(value, *head)
+            del value
+            if result is None:
+                if stop >= last:
+                    return projected
+                result = projected.new_empty(
+                    (last - first, *projected.shape[1:])
+                )
+            result[start - first:stop - first].copy_(projected)
+            del projected
+        return result
 
     video_shift = shifts[0] if pdd is not None else None
     audio_shift = shifts[1] if pdd is not None else None

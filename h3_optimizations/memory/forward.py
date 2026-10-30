@@ -418,9 +418,15 @@ def make_forward(block, layer_index, config, original_forward=None):
         if held_error is not None:
             _log_mlp_fallback(layer_index, held_error)
 
+        # A held floating or W4A8 fc1 cannot consume the fused carrier;
+        # quantizing Norm2 for it would only be discarded.
+        fused_mlp_norm = use_fused_norm_quantize and (
+            mlp_path == 'convrot'
+            or (mlp_path == 'held' and held.supports_prequantized_fc1())
+        )
         try:
             for chunk in chunks:
-                if use_fused_norm_quantize and mlp_path in ('convrot', 'held'):
+                if fused_mlp_norm:
                     with diagnostics.stage('norm2_modulation_quantize'):
                         carrier = _quantize_norm_modulation(
                             x[chunk.start:chunk.stop],
@@ -447,6 +453,7 @@ def make_forward(block, layer_index, config, original_forward=None):
                             continue
                         with diagnostics.stage('mlp_fc1'):
                             expanded = held.fc1_prequantized(*carrier, x.dtype)
+                        del carrier
                         if expanded is not None:
                             _run_held_native_gated(
                                 held,
@@ -456,7 +463,7 @@ def make_forward(block, layer_index, config, original_forward=None):
                                 chunk.mod_row,
                                 expanded=expanded,
                             )
-                            del carrier, expanded
+                            del expanded
                             continue
                 with diagnostics.stage('norm2_modulation'):
                     h = block.norm2(x[chunk.start:chunk.stop])

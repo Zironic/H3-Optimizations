@@ -139,14 +139,23 @@ class HeldMLP:
         comfy.ops.run_every_op()
         return self.fc1_weight.linear(x)
 
-    def fc1_prequantized(self, qdata, scale, out_dtype):
-        weight = self.fc1_weight.weight
+    def _fc1_convrot_parts(self):
         if self.fc1_weight.bias is not None:
             return None
         try:
-            weight_qdata, weight_scale = _convrot_parts(weight, "fc1")
+            return _convrot_parts(self.fc1_weight.weight, "fc1")
         except (TypeError, ValueError):
             return None
+
+    def supports_prequantized_fc1(self):
+        """Whether fc1 can consume a fused Norm2 ConvRot carrier."""
+        return self._fc1_convrot_parts() is not None
+
+    def fc1_prequantized(self, qdata, scale, out_dtype):
+        parts = self._fc1_convrot_parts()
+        if parts is None:
+            return None
+        weight_qdata, weight_scale = parts
         from ..qkv.int8 import HeldConvRotINT8Linear
 
         comfy.ops.run_every_op()

@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
@@ -74,6 +74,66 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'positive integer'):
             ActivationMemoryConfig(chunk_rows=0)
 
+    def test_held_fc1_reports_whether_it_takes_a_carrier(self):
+        held = linear_module.HeldMLP.__new__(linear_module.HeldMLP)
+        held.fc1_weight = SimpleNamespace(weight=object(), bias=None)
+        parts = (torch.zeros(4, 256, dtype=torch.int8), torch.ones(4))
+        with patch.object(linear_module, '_convrot_parts', return_value=parts):
+            self.assertTrue(held.supports_prequantized_fc1())
+        with patch.object(
+            linear_module, '_convrot_parts', side_effect=TypeError('bf16'),
+        ):
+            self.assertFalse(held.supports_prequantized_fc1())
+        held.fc1_weight = SimpleNamespace(weight=object(), bias=torch.zeros(4))
+        with patch.object(linear_module, '_convrot_parts', return_value=parts):
+            self.assertFalse(held.supports_prequantized_fc1())
+
+    def test_floating_held_mlp_never_quantizes_norm2(self):
+        torch.manual_seed(41)
+        block = DiTBlock(
+            hidden=256, heads=2, head_dim=128, ffn=64, t_dim=24,
+            eps=1e-6, qk_eps=1e-6, dtype=torch.bfloat16, device='cpu',
+            operations=comfy.ops.disable_weight_init,
+        )
+        for parameter in block.parameters():
+            parameter.detach().copy_(torch.randn_like(parameter) * 0.03)
+            parameter.requires_grad_(False)
+        x = torch.randn(40, 256, dtype=torch.bfloat16) * 0.1
+        t_emb = torch.randn(2, 24, dtype=torch.bfloat16) * 0.1
+        segments = [(0, 17, 0), (17, 40, 3)]
+
+        def run(fused):
+            config = ActivationMemoryConfig(
+                mode=MODE_NATIVE, chunk_rows=16, alignment=8,
+                fused_norm_quantize=fused,
+            )
+            return make_forward(block, 0, config)(
+                x.clone(), t_emb, segments,
+                rope_freqs=None, transformer_options={},
+            )
+
+        expected = run(False)
+        with (
+            patch.object(torch.Tensor, 'is_cuda', new_callable=PropertyMock, return_value=True),
+            patch(
+                'h3_optimizations.memory.forward.HeldConvRotINT8Linear.prequantized_is_available',
+                return_value=True,
+            ),
+            patch(
+                'h3_optimizations.memory.forward.rms_adaln_int8_rowwise_convrot256_is_available',
+                return_value=True,
+            ),
+            patch(
+                'h3_optimizations.memory.forward._quantize_norm_modulation',
+                side_effect=AssertionError('BF16 fc1 cannot use a Norm2 carrier'),
+            ),
+            patch.object(
+                NormalizedRows, 'quantize_convrot256', return_value=None,
+            ),
+        ):
+            actual = run(True)
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_held_convrot_fc1_accepts_a_prequantized_carrier(self):
         held = linear_module.HeldMLP.__new__(linear_module.HeldMLP)
         held.fc1_weight = SimpleNamespace(weight=object(), bias=None)
@@ -109,6 +169,22 @@ class MemoryTests(unittest.TestCase):
             weight_scale,
             torch.bfloat16,
         )
+
+    def test_norm1_declines_per_token_spans_before_quantizing(self):
+        source = NormalizedRows(
+            torch.ones(8, 256, dtype=torch.bfloat16),
+            SimpleNamespace(weight=torch.ones(256), eps=1e-6),
+            [(0, 4, 0), (4, 8, torch.zeros(4, dtype=torch.long))],
+            torch.zeros(1, 256),
+            torch.zeros(1, 256),
+            lambda *_args: None,
+        )
+        source.enable_fused_convrot_quantization()
+        with patch(
+            'h3_optimizations.normalized_rows.quantize_rms_adaln_int8_rowwise_convrot256',
+        ) as quantize:
+            self.assertIsNone(source.quantize_convrot256(0, 8))
+        quantize.assert_not_called()
 
     def test_chunk_planner_preserves_modulation_boundaries(self):
         result = list(
