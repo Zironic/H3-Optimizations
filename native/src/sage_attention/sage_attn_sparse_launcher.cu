@@ -65,7 +65,8 @@ void launch_packed_64_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                            int stride_h_v, int stride_d_v, int stride_bz_o,
                            int stride_seq_o, int stride_h_o, float sm_scale,
                            int stride_bz_q_scale, int stride_h_q_scale,
-                           int batch_size, cudaStream_t stream) {
+                           int batch_size, cudaStream_t stream,
+                           ChunkedVLaunch chunks = ChunkedVLaunch{}) {
   // Q tile plus one 128-row K tile and one 128-column V tile; the output
   // staging reuses the start of the buffer after the last iteration.
   constexpr size_t smem_max = 64 * SPARSE_HEAD_DIM + 2 * 128 * SPARSE_HEAD_DIM;
@@ -77,6 +78,15 @@ void launch_packed_64_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
 #else
   auto kernel = qk_int_sv_i8_packed_attn_kernel<64, DTypeOut, RETURN_LSE, 1, DENSE>;
 #endif
+  if (chunks.chunked()) {
+#ifdef H3_PACKED64_FINE
+    kernel = DENSE
+        ? qk_int_sv_i8_packed_attn_kernel<64, DTypeOut, RETURN_LSE, 1, true, true>
+        : qk_int_sv_i8_packed_fine_attn_kernel<64, DTypeOut, RETURN_LSE, 1, true>;
+#else
+    kernel = qk_int_sv_i8_packed_attn_kernel<64, DTypeOut, RETURN_LSE, 1, DENSE, true>;
+#endif
+  }
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(smem_max));
@@ -94,7 +104,7 @@ void launch_packed_64_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
       stride_h_q_scale, sm_scale, lut, valid_block_num,
-      static_cast<uint32_t>(lut_stride));
+      static_cast<uint32_t>(lut_stride), chunks.blocks, chunks.shift);
   error = cudaGetLastError();
   if (error != cudaSuccess) {
     throw std::runtime_error(
@@ -116,7 +126,8 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                         int stride_h_v, int stride_d_v, int stride_bz_o,
                         int stride_seq_o, int stride_h_o, float sm_scale,
                         int stride_bz_q_scale, int stride_h_q_scale,
-                        int batch_size, cudaStream_t stream) {
+                        int batch_size, cudaStream_t stream,
+                        ChunkedVLaunch chunks = ChunkedVLaunch{}) {
   // Same warp tiling the dense kernel picks for head_dim 128: a 16-row warp
   // tile halves the live FP32 output accumulator set.
   constexpr int WARP_Q = 16;
@@ -134,6 +145,16 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       QuantGranularity::kPerThread, float, false, DTypeOut,
       ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE, true, false, false, true,
       PER_TILE_KV_LEN>;
+  if constexpr (!PER_TILE_KV_LEN) {
+    if (chunks.chunked()) {
+      kernel = qk_int_sv_i8_sparse_attn_kernel<
+          SPARSE_CTA_Q, SPARSE_CTA_K, WARP_Q, WARP_K, SPARSE_HEAD_DIM,
+          DataType::kInt8, QuantGranularity::kPerThread,
+          QuantGranularity::kPerThread, float, false, DTypeOut,
+          ComputeUnit::kCudaCore, MaskMode::kNone, RETURN_LSE, true, false,
+          false, true, false, true>;
+    }
+  }
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -153,7 +174,8 @@ void launch_sparse_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       stride_h_q, stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,
       stride_h_v, stride_d_v, stride_bz_o, stride_seq_o, stride_h_o,
       stride_bz_q_scale, stride_h_q_scale, sm_scale, lut, valid_block_num,
-      static_cast<uint32_t>(lut_stride), kv_tile_len);
+      static_cast<uint32_t>(lut_stride), kv_tile_len, chunks.blocks,
+      chunks.shift);
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
@@ -177,10 +199,20 @@ void launch_packed_32_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
                            int stride_h_v, int stride_d_v, int stride_bz_o,
                            int stride_seq_o, int stride_h_o, float sm_scale,
                            int stride_bz_q_scale, int stride_h_q_scale,
-                           int batch_size, cudaStream_t stream) {
+                           int batch_size, cudaStream_t stream,
+                           ChunkedVLaunch chunks = ChunkedVLaunch{},
+                           const int32_t *v_changes = nullptr,
+                           int v_change_stride = 0) {
   constexpr size_t smem_max = 64 * SPARSE_HEAD_DIM + 2 * 128 * SPARSE_HEAD_DIM;
+  if (chunks.chunked() && v_changes == nullptr) {
+    throw std::runtime_error(
+        "chunk-scaled 64Q x 32KV attention needs the route's V block changes");
+  }
   auto kernel =
       qk_int_sv_i8_packed_fine_attn_kernel<32, DTypeOut, RETURN_LSE, 1>;
+  if (chunks.chunked()) {
+    kernel = qk_int_sv_i8_packed_fine_attn_kernel<32, DTypeOut, RETURN_LSE, 1, true>;
+  }
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(smem_max));
@@ -198,7 +230,8 @@ void launch_packed_32_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
       stride_h_q_scale, sm_scale, lut, valid_block_num,
-      static_cast<uint32_t>(lut_stride));
+      static_cast<uint32_t>(lut_stride), chunks.blocks, chunks.shift,
+      v_changes, static_cast<uint32_t>(v_change_stride));
   error = cudaGetLastError();
   if (error != cudaSuccess) {
     throw std::runtime_error(
@@ -216,7 +249,8 @@ void launch_sage_attn_packed_dense_kernel(
     int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
-    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    float sm_scale, int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows) {
   if (cta_k != 64 || head_dim != 128) {
     throw std::runtime_error("packed dense attention requires a 64KV carrier and head_dim 128");
   }
@@ -227,6 +261,7 @@ void launch_sage_attn_packed_dense_kernel(
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
   const int qs_stride_h = div_ceil(qo_len, 128) * 32;
+  const ChunkedVLaunch chunks = chunked_v_launch(v_scale_rows, kv_len);
 #define LAUNCH_PACKED_DENSE(DT) \
   launch_packed_64_impl<DT, false, true>( \
       q_, k_, v_, static_cast<DT *>(o), nullptr, qs_, ks_, vs_, nullptr, \
@@ -234,7 +269,7 @@ void launch_sage_attn_packed_dense_kernel(
       stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, \
       stride_h_k, stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, \
       stride_seq_o, stride_h_o, sm_scale, qs_stride_h * num_qo_heads, \
-      qs_stride_h, batch_size, stream)
+      qs_stride_h, batch_size, stream, chunks)
   if (output_dtype_code == 1) {
     LAUNCH_PACKED_DENSE(half);
   } else {
@@ -269,7 +304,8 @@ void launch_sparse(
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
     int stride_bz_q_scale, int stride_h_q_scale, float sm_scale,
-    int output_dtype_code, cudaStream_t stream) {
+    int output_dtype_code, cudaStream_t stream, int v_scale_rows,
+    const void *v_block_changes, int v_change_stride) {
   if (!((cta_q == 128 || cta_q == 64) && (cta_k == 128 || cta_k == 64)) &&
       !(cta_q == 64 && cta_k == 32)) {
     throw std::runtime_error(
@@ -287,6 +323,7 @@ void launch_sparse(
   }
 
   int num_kv_groups = num_qo_heads / num_kv_heads;
+  const ChunkedVLaunch chunks = chunked_v_launch(v_scale_rows, kv_len);
 
   // The kernel takes non-const pointers but does not modify its inputs.
   auto q_ = const_cast<int8_t *>(static_cast<const int8_t *>(q));
@@ -306,10 +343,10 @@ void launch_sparse(
                          stride_bz_k, stride_seq_k, stride_h_k, stride_bz_v,   \
                          stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,    \
                          stride_h_o, sm_scale, stride_bz_q_scale,              \
-                         stride_h_q_scale, batch_size, stream)
+                         stride_h_q_scale, batch_size, stream, chunks)
 
   if (cta_q == 64 && cta_k == 32) {
-#define LAUNCH_PACKED_32(DT)                                                     launch_packed_32_impl<DT, RETURN_LSE>(                                             q_, k_, v_, static_cast<DT *>(o), static_cast<float *>(lse), qs_, ks_,         vs_, lut_, valid_, lut_stride, qo_len, kv_len, num_qo_heads,                   num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,             stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,                 stride_bz_o, stride_seq_o, stride_h_o, sm_scale, stride_bz_q_scale,            stride_h_q_scale, batch_size, stream)
+#define LAUNCH_PACKED_32(DT)                                                     launch_packed_32_impl<DT, RETURN_LSE>(                                             q_, k_, v_, static_cast<DT *>(o), static_cast<float *>(lse), qs_, ks_,         vs_, lut_, valid_, lut_stride, qo_len, kv_len, num_qo_heads,                   num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,             stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,                 stride_bz_o, stride_seq_o, stride_h_o, sm_scale, stride_bz_q_scale,            stride_h_q_scale, batch_size, stream, chunks, static_cast<const int32_t *>(v_block_changes), v_change_stride)
     if (output_dtype_code == 1) {
       LAUNCH_PACKED_32(half);
     } else {
@@ -342,7 +379,7 @@ void launch_sparse(
       num_kv_groups, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,       \
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,           \
       stride_bz_o, stride_seq_o, stride_h_o, sm_scale, stride_bz_q_scale,      \
-      stride_h_q_scale, batch_size, stream)
+      stride_h_q_scale, batch_size, stream, chunks)
     if (output_dtype_code == 1) {
       LAUNCH_PACKED_64(half);
     } else {
@@ -370,14 +407,17 @@ void launch_sage_attn_sparse_kernel(
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
     int stride_bz_q_scale, int stride_h_q_scale, float sm_scale,
-    int output_dtype_code, cudaStream_t stream) {
+    int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows, const void *v_block_changes,
+    int v_change_stride) {
   launch_sparse<false>(
       q, k, v, o, nullptr, q_scale, k_scale, v_scale, lut, valid_block_num,
       lut_stride, cta_q, cta_k, batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
       head_dim, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
-      stride_h_q_scale, sm_scale, output_dtype_code, stream);
+      stride_h_q_scale, sm_scale, output_dtype_code, stream, v_scale_rows,
+      v_block_changes, v_change_stride);
 }
 
 void launch_sage_attn_sparse_kernel_lse(
@@ -389,7 +429,9 @@ void launch_sage_attn_sparse_kernel_lse(
     int stride_bz_k, int stride_seq_k, int stride_h_k, int stride_bz_v,
     int stride_h_v, int stride_d_v, int stride_bz_o, int stride_seq_o,
     int stride_h_o, int stride_bz_q_scale, int stride_h_q_scale,
-    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    float sm_scale, int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows, const void *v_block_changes,
+    int v_change_stride) {
   if (lse == nullptr) {
     throw std::runtime_error("sage_attn_sparse_lse: an LSE output is required");
   }
@@ -399,7 +441,8 @@ void launch_sage_attn_sparse_kernel_lse(
       head_dim, stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k,
       stride_seq_k, stride_h_k, stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o, stride_bz_q_scale,
-      stride_h_q_scale, sm_scale, output_dtype_code, stream);
+      stride_h_q_scale, sm_scale, output_dtype_code, stream, v_scale_rows,
+      v_block_changes, v_change_stride);
 }
 
 // H3 VSA: 64Q x 64KV traversal over padded tiles whose live key count is

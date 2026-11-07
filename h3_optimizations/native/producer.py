@@ -88,6 +88,9 @@ class Int8AttentionProducer:
     k_scale: torch.Tensor
     v: torch.Tensor | None = None
     v_scale: torch.Tensor | None = None
+    # Rows per V scale block; 0 is the global carrier (see
+    # PrequantizedInt8Attention.v_scale_rows).
+    v_scale_rows: int = 0
     _q_ranges: list = field(default_factory=list, repr=False)
     _k_ranges: list = field(default_factory=list, repr=False)
     _finalized: bool = field(default=False, repr=False)
@@ -534,4 +537,5 @@ def finalize_int8_attention_producer(producer):
         attention_scale=spec.attention_scale,
         cta_k=spec.cta_k,
         anchor_indices=producer.anchor.indices,
+        v_scale_rows=int(producer.v_scale_rows),
     )

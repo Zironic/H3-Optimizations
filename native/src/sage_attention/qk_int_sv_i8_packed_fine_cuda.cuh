@@ -24,6 +24,7 @@
 #pragma once
 
 #include "qk_int_sv_i8_sparse_cuda.cuh"
+#include "chunked_v_scale.cuh"
 
 namespace h3_packed_fine {
 
@@ -104,7 +105,8 @@ __device__ __forceinline__ void update_mdo_packed2(
 
 } // namespace h3_packed_fine
 
-template <uint32_t SUB_K, typename DTypeOut, bool return_lse, uint32_t MIN_BLOCKS>
+template <uint32_t SUB_K, typename DTypeOut, bool return_lse, uint32_t MIN_BLOCKS,
+          bool chunked_v = false>
 __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -119,9 +121,14 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn
     const uint32_t stride_h_o, const uint32_t stride_bz_q_scale,
     const uint32_t stride_h_q_scale, float sm_scale,
     const int32_t *__restrict__ BlockLut,
-    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
+    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride,
+    const uint32_t v_scale_blocks = 1, const uint32_t v_scale_shift = 0,
+    const int32_t *__restrict__ VBlockChanges = nullptr,
+    const uint32_t v_change_stride = 0) {
   static_assert(SUB_K == 16 || SUB_K == 32 || SUB_K == 64,
                 "SUB_K must be 16, 32 or 64");
+  static_assert(!chunked_v || SUB_K >= 32,
+                "chunk-scaled V needs whole subtiles per 32-key P x V group");
   constexpr uint32_t CARRIER_K = 64;
   constexpr uint32_t CTA_Q = 64;
   constexpr uint32_t CTA_K = 128;
@@ -326,6 +333,18 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn
   uint32_t cursor = 0;
   uint32_t running_block = 0;
   uint32_t blocks[N_SUB];
+  // Chunk-scaled V (chunked_v): the block the P x V accumulators are
+  // expressed in, and this CTA's [blocks, head_dim] scales on demand.
+  uint32_t v_block = 0;
+  auto v_scale_head = [&]() -> const float * {
+    return V_scale +
+           static_cast<int64_t>(batch_id * (num_qo_heads / num_kv_groups) +
+                                kv_head) *
+               v_scale_blocks * head_dim;
+  };
+  // Routes must be block-aligned: within each route row, every V scale
+  // block except the last contributes a multiple of N_SUB entries, so an
+  // iteration never mixes blocks, and the router lists where blocks change.
   uint32_t decoded_iters = 0;
   bool blocks_coarse = false;
   int32_t pending[N_SUB];
@@ -444,42 +463,71 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn
   load_V();
   cp_async::commit_group();
 
-  for (uint32_t iter = 0; iter + 1 < num_iterations; iter++) {
-    cp_async::wait_group<1>();
-    __syncthreads();
-    compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                   num_tiles_qk_inner, swizzle_mode_QK,
-                   QK_SMEM_STRIDE / PACK_SIZE_QK, DataType::kInt8>(
-        smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
-    __syncthreads();
-
-    decode();
-    const uint32_t tail_next = tail_bits();
-    load_K();
-    cp_async::commit_group();
-
-    {
-      float psc[2 * num_tiles_k];
-#pragma unroll
-      for (uint32_t j = 0; j < 2 * num_tiles_k; j++) {
-        psc[j] = qk_scale * k_scale[j / (SUB_K / 8)];
-      }
-      uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
-      h3_packed_fine::update_mdo_packed2<num_tiles_k, num_tiles_v, SUB_K / 8>(
-          RS, RO, m, d, psc, S_U8_OFFSET, RS_u8);
-      load_scales();
-
+  // One integer-softmax iteration over the routed subtiles in shared memory.
+  auto iteration = [&]() {
       cp_async::wait_group<1>();
       __syncthreads();
-      compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                      num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-          smem_V, RS, RS_u8, RO);
-    }
-    __syncthreads();
+      compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                     num_tiles_qk_inner, swizzle_mode_QK,
+                     QK_SMEM_STRIDE / PACK_SIZE_QK, DataType::kInt8>(
+          smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
+      __syncthreads();
 
-    load_V();
-    cp_async::commit_group();
-    tail_cur = tail_next;
+      decode();
+      const uint32_t tail_next = tail_bits();
+      load_K();
+      cp_async::commit_group();
+
+      {
+        float psc[2 * num_tiles_k];
+#pragma unroll
+        for (uint32_t j = 0; j < 2 * num_tiles_k; j++) {
+          psc[j] = qk_scale * k_scale[j / (SUB_K / 8)];
+        }
+        uint32_t RS_u8[num_tiles_q][num_tiles_k / 2][4];
+        h3_packed_fine::update_mdo_packed2<num_tiles_k, num_tiles_v, SUB_K / 8>(
+            RS, RO, m, d, psc, S_U8_OFFSET, RS_u8);
+        load_scales();
+
+        cp_async::wait_group<1>();
+        __syncthreads();
+        compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
+                        num_tiles_v, swizzle_mode_V,
+                        V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
+      }
+      __syncthreads();
+
+      load_V();
+      cp_async::commit_group();
+      tail_cur = tail_next;
+  };
+
+  if constexpr (chunked_v) {
+    // Aligned routes (int8_attention.align_route_to_v_blocks) list, per route
+    // row, the iterations where the V scale block changes, ending with a
+    // sentinel. The block changes only there, so the hot loop is the global
+    // kernel's: the rescale runs between inner loops, never beside P x V.
+    const int32_t *changes =
+        VBlockChanges + static_cast<int64_t>(route_idx) * v_change_stride;
+    v_block = (blocks[0] * SUB_K) >> v_scale_shift;  // accumulators still zero
+    uint32_t iter = 0;
+    uint32_t next = static_cast<uint32_t>(changes[0]);
+    while (true) {
+      const uint32_t stop = min(next, num_iterations - 1);
+      for (; iter < stop; iter++) {
+        iteration();
+      }
+      if (iter != next) {
+        break;  // the final iteration is next and stays in this block
+      }
+      chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+          RO, v_scale_head(), v_block, (blocks[0] * SUB_K) >> v_scale_shift);
+      next = static_cast<uint32_t>(*++changes);
+    }
+  } else {
+    for (uint32_t iter = 0; iter + 1 < num_iterations; iter++) {
+      iteration();
+    }
   }
 
   // Final iteration: float path with the ragged-sequence and missing-subtile
@@ -523,8 +571,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn
     cp_async::wait_group<0>();
     __syncthreads();
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V,
+                    V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
     __syncthreads();
   }
 
@@ -533,8 +581,10 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_fine_attn
   {
     float v_scale[4];
     const float *V_scale_base_ptr =
-        V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
-        kv_head * head_dim + (lane_id % 4) * 2;
+        chunked_v
+            ? chunked_v_epilogue<head_dim>(v_scale_head(), v_block)
+            : V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
+                  kv_head * head_dim + (lane_id % 4) * 2;
 #pragma unroll
     for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
       ((float2 *)v_scale)[0] = *((const float2 *)(V_scale_base_ptr + fv * 16));

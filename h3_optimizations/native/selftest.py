@@ -619,3 +619,121 @@ def sparse_lse_check(device=None, *, force=False):
                 LOG_PREFIX, key, detail,
             )
         return passed
+
+
+_chunk_lock = threading.Lock()
+_chunk_results = {}
+_CHUNK_ROWS = 128  # five V scale blocks at 640 keys
+
+
+def run_chunk_scaled_v(device=None):
+    """Chunk-scaled V kernels against the global ones, on this GPU.
+
+    V is built so every 128-row block has the same per-channel maximum, so the
+    chunk scales equal the global scale and every chunk-scaled kernel must
+    reproduce its global counterpart bit for bit: the rescales and change-list
+    loop run, with ratios of exactly one. Sparse geometries use a seeded partial
+    route aligned by the native pass, so boundaries fall inside routes.
+    """
+    from dataclasses import replace
+
+    from . import int8_attention as native
+    from .v_staging import ChunkScaledVCarrier
+
+    device = torch.device('cuda' if device is None else device)
+    detail = {}
+    try:
+        q, k, v = _samples(device, seed=20260825)
+        v = v.clamp(-3.5, 3.5)
+        rows = torch.arange(_KV_LEN, device=device)
+        generator = torch.Generator(device=device).manual_seed(20260825)
+        peak = 4.0 * torch.sign(torch.randn(
+            _BATCH, _HEADS, 1, _HEAD_DIM, device=device, generator=generator))
+        v[:, :, rows % _CHUNK_ROWS == 0, :] = peak.to(v.dtype)
+        v = v.contiguous()
+        results = {}
+
+        def pair(cta_k):
+            carrier = native.prequantize_int8_attention(q, k, v, cta_k=cta_k)
+            spec = type('Spec', (), {})()
+            spec.k_input_shape = tuple(v.shape)
+            spec.kernel_head_dim = _HEAD_DIM
+            spec.cta_k = cta_k
+            spec.device = device
+            spec.input_dtype = v.dtype
+            staging = ChunkScaledVCarrier(spec, _CHUNK_ROWS)
+            for start in range(0, _KV_LEN, _CHUNK_ROWS):
+                staging.quantize(v[..., start:start + _CHUNK_ROWS, :], start)
+            v_int8, v_scale = staging.finish()
+            chunked = replace(carrier, v=v_int8, v_scale=v_scale,
+                              v_scale_rows=_CHUNK_ROWS)
+            first = v_scale.view(_BATCH, _HEADS, -1, _HEAD_DIM)[:, :, 0]
+            return replace(chunked, v_scale=first.reshape(-1).contiguous(),
+                           v_scale_rows=0), chunked
+
+        for cta_k in (64, 128):
+            same, chunked = pair(cta_k)
+            results['dense_%d' % cta_k] = torch.equal(
+                native.int8_attention_from_prequantized(chunked),
+                native.int8_attention_from_prequantized(same),
+            )
+        if native.packed_dense_attention_is_available(device):
+            same, chunked = pair(64)
+            results['packed_dense'] = torch.equal(
+                native.packed_int8_attention_from_prequantized(chunked),
+                native.packed_int8_attention_from_prequantized(same),
+            )
+        route_generator = torch.Generator().manual_seed(20260825)
+        for q_tile, kv_tile in _SPARSE_PARITY_GEOMETRIES:
+            if not sparse_geometry_check(q_tile, kv_tile, device):
+                continue
+            same, chunked = pair(native.carrier_kv_tile(kv_tile))
+            q_tiles = -(-_Q_LEN // q_tile)
+            kv_tiles = -(-_KV_LEN // kv_tile)
+            keep = torch.rand(_BATCH, _HEADS, q_tiles, kv_tiles,
+                              generator=route_generator) < 0.45
+            keep[..., 0] = True
+            position = torch.arange(kv_tiles).expand_as(keep)
+            ordered = torch.where(keep, position, kv_tiles).sort(dim=-1).values
+            route = native.BlockSparseRoute(
+                indices=torch.where(ordered == kv_tiles, 0, ordered).to(
+                    torch.int32).contiguous().to(device),
+                counts=keep.sum(dim=-1).to(torch.int32).contiguous().to(device),
+                q_tile=q_tile, kv_tile=kv_tile, encoding='absolute',
+            )
+            route = native.align_route_to_v_blocks(
+                route, _CHUNK_ROWS,
+                native.packed_route_group(q_tile, kv_tile, device), _KV_LEN)
+            expected = native.block_sparse_int8_attention_from_prequantized(
+                same, route, validate_geometry=False)
+            actual = native.block_sparse_int8_attention_from_prequantized(
+                chunked, route, validate_geometry=False)
+            results[_geometry_key(q_tile, kv_tile)] = bool(
+                torch.equal(actual, expected) and torch.isfinite(actual).all())
+        torch.cuda.synchronize(device)
+    except Exception as error:  # noqa: BLE001 - reporting is the job
+        detail['error'] = '%s: %s' % (type(error).__name__, error)
+        detail['passed'] = False
+        return False, detail
+    passed = bool(results) and all(results.values())
+    detail.update({'bit_identical': results, 'passed': passed})
+    return passed, detail
+
+
+def chunk_scaled_v_check(device=None, *, force=False):
+    """Whether chunk-scaled V reproduced the global kernels on this GPU."""
+    if not torch.cuda.is_available() or not loader.is_available():
+        return False
+    key = _cache_key(device)
+    with _chunk_lock:
+        if not force and key in _chunk_results:
+            return bool(_chunk_results[key]['passed'])
+        passed, detail = run_chunk_scaled_v(device)
+        _chunk_results[key] = detail
+        if not passed:
+            logging.warning(
+                '%s chunk-scaled V self-test failed on %s; single-pass V is '
+                'disabled and Lower VRAM uses two-pass V. Detail: %s',
+                LOG_PREFIX, key, detail,
+            )
+        return passed

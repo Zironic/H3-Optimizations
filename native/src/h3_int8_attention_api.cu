@@ -44,7 +44,8 @@ void launch_sage_attn_kernel(
     int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
     int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int v_scale_rows);
 
 void launch_sage_attn_sparse_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
@@ -53,7 +54,8 @@ void launch_sage_attn_sparse_kernel(
     int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
     int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
-    float sm_scale, int output_dtype_code, cudaStream_t stream);
+    float sm_scale, int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows, const void *v_block_changes, int v_change_stride);
 
 void launch_sage_attn_packed_dense_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
@@ -61,7 +63,8 @@ void launch_sage_attn_packed_dense_kernel(
     int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
     int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
     int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int v_scale_rows);
 
 void launch_sage_attn_sparse_tiles_kernel(
     const void *q, const void *k, const void *v, void *o, const void *q_scale,
@@ -82,7 +85,8 @@ void launch_sage_attn_sparse_kernel_lse(
     int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
     int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
     int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
-    int output_dtype_code, cudaStream_t stream);
+    int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows, const void *v_block_changes, int v_change_stride);
 
 const char *sage_attn_sparse_route_encoding();
 
@@ -137,6 +141,14 @@ void launch_h3_threshold_route(const void *q, const void *k_video, const void *s
                                int64_t q_bh_stride, int64_t q_row_stride, int64_t k_bh_stride,
                                int video_tiles, int pvs, int kv_tiles, int dense_rows, int width,
                                float tau, cudaStream_t stream);
+
+void launch_h3_align_route_v_blocks(const void *indices, const void *counts,
+                                    void *out_indices, void *out_counts,
+                                    void *out_changes, int rows, int width_in,
+                                    int width_out, int change_width,
+                                    int tiles_per_block, int group,
+                                    int total_tiles, int in_delta,
+                                    int out_delta, cudaStream_t stream);
 
 void launch_quant_v_int8_kernel(const void *v, void *out, void *scale, int B,
                                 int H, int N, int D, int padded_N, int64_t sb,
@@ -230,7 +242,7 @@ H3_API int h3_int8_dense_attention(
       q, k, v, o, q_scale, k_scale, v_scale, nullptr, 0, 0, 0, 0, -1, cta_k, B,
       Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h,
       v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale,
-      output_dtype_code, reinterpret_cast<cudaStream_t>(stream)))
+      output_dtype_code, reinterpret_cast<cudaStream_t>(stream), 0))
 }
 
 H3_API int h3_int8_packed_dense_attention(
@@ -244,7 +256,7 @@ H3_API int h3_int8_packed_dense_attention(
       q, k, v, o, q_scale, k_scale, v_scale, cta_k, B, Lq, Lk, H_q, H_kv, D,
       q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h,
       v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale, output_dtype_code,
-      reinterpret_cast<cudaStream_t>(stream)))
+      reinterpret_cast<cudaStream_t>(stream), 0))
 }
 
 H3_API int h3_int8_sparse_attention(
@@ -260,7 +272,7 @@ H3_API int h3_int8_sparse_attention(
       cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
       k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n,
       o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
-      reinterpret_cast<cudaStream_t>(stream)))
+      reinterpret_cast<cudaStream_t>(stream), 0, nullptr, 0))
 }
 
 // Additive to ABI 4: 64Q x 64KV sparse traversal over padded tiles with a
@@ -296,7 +308,79 @@ H3_API int h3_int8_sparse_attention_lse(
       lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
       q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
       o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
-      reinterpret_cast<cudaStream_t>(stream)))
+      reinterpret_cast<cudaStream_t>(stream), 0, nullptr, 0))
+}
+
+// Additive to ABI 4: chunk-scaled INT8 V. Identical to the entry point of the
+// same stem, plus v_scale_rows: V scales are [B, H_kv, ceil(Lk / rows), D],
+// and, for the sparse ones, the aligned route's V block change list
+// (h3_int8_align_route_v_blocks) with its row stride,
+// one per block of v_scale_rows keys (a power of two, at least 128), instead
+// of one per channel over the whole sequence. Zero keeps the global carrier.
+// Loaders treat these as optional.
+H3_API int h3_int8_dense_attention_chunked_v(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, int cta_k, int B, int Lq, int Lk,
+    int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, float sm_scale, int output_dtype_code,
+    int v_scale_rows, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, nullptr, 0, 0, 0, 0, -1, cta_k, B,
+      Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h,
+      v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale,
+      output_dtype_code, reinterpret_cast<cudaStream_t>(stream), v_scale_rows))
+}
+
+H3_API int h3_int8_packed_dense_attention_chunked_v(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, int cta_k, int B, int Lq, int Lk,
+    int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, float sm_scale,
+    int output_dtype_code, int v_scale_rows, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_packed_dense_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, cta_k, B, Lq, Lk, H_q, H_kv, D,
+      q_st_bz, q_st_n, q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h,
+      v_st_d, o_st_bz, o_st_n, o_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream), v_scale_rows))
+}
+
+H3_API int h3_int8_sparse_attention_chunked_v(
+    const void *q, const void *k, const void *v, void *o, const void *q_scale,
+    const void *k_scale, const void *v_scale, const void *lut,
+    const void *valid_block_num, int lut_stride, int cta_q, int cta_k, int B,
+    int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz, int q_st_n, int q_st_h,
+    int k_st_bz, int k_st_n, int k_st_h, int v_st_bz, int v_st_h, int v_st_d,
+    int o_st_bz, int o_st_n, int o_st_h, int qs_st_bz, int qs_st_h,
+    float sm_scale, int output_dtype_code, int v_scale_rows, const void *v_block_changes,
+    int v_change_stride, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_kernel(
+      q, k, v, o, q_scale, k_scale, v_scale, lut, valid_block_num, lut_stride,
+      cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n, q_st_h,
+      k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz, o_st_n,
+      o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream), v_scale_rows,
+      v_block_changes, v_change_stride))
+}
+
+H3_API int h3_int8_sparse_attention_lse_chunked_v(
+    const void *q, const void *k, const void *v, void *o, void *lse,
+    const void *q_scale, const void *k_scale, const void *v_scale,
+    const void *lut, const void *valid_block_num, int lut_stride, int cta_q,
+    int cta_k, int B, int Lq, int Lk, int H_q, int H_kv, int D, int q_st_bz,
+    int q_st_n, int q_st_h, int k_st_bz, int k_st_n, int k_st_h,
+    int v_st_bz, int v_st_h, int v_st_d, int o_st_bz, int o_st_n,
+    int o_st_h, int qs_st_bz, int qs_st_h, float sm_scale,
+    int output_dtype_code, int v_scale_rows, const void *v_block_changes,
+    int v_change_stride, uintptr_t stream) noexcept {
+  H3_GUARD(launch_sage_attn_sparse_kernel_lse(
+      q, k, v, o, lse, q_scale, k_scale, v_scale, lut, valid_block_num,
+      lut_stride, cta_q, cta_k, B, Lq, Lk, H_q, H_kv, D, q_st_bz, q_st_n,
+      q_st_h, k_st_bz, k_st_n, k_st_h, v_st_bz, v_st_h, v_st_d, o_st_bz,
+      o_st_n, o_st_h, qs_st_bz, qs_st_h, sm_scale, output_dtype_code,
+      reinterpret_cast<cudaStream_t>(stream), v_scale_rows,
+      v_block_changes, v_change_stride))
 }
 
 H3_API int h3_int8_quantize_qk(
@@ -434,6 +518,19 @@ H3_API int h3_int8_threshold_route(
                               q_row_stride, k_bh_stride, video_tiles, pvs, kv_tiles, dense_rows,
                               width, tau, reinterpret_cast<cudaStream_t>(stream));
   })
+}
+
+// Additive to ABI 4: pad sparse routes so no packed iteration mixes
+// chunk-scaled V blocks (see h3_route_align.cu). Optional for loaders.
+H3_API int h3_int8_align_route_v_blocks(
+    const void *indices, const void *counts, void *out_indices,
+    void *out_counts, void *out_changes, int rows, int width_in,
+    int width_out, int change_width, int tiles_per_block, int group,
+    int total_tiles, int in_delta, int out_delta, uintptr_t stream) noexcept {
+  H3_GUARD(launch_h3_align_route_v_blocks(
+      indices, counts, out_indices, out_counts, out_changes, rows, width_in,
+      width_out, change_width, tiles_per_block, group, total_tiles, in_delta,
+      out_delta, reinterpret_cast<cudaStream_t>(stream)))
 }
 
 H3_API int h3_int8_quantize_v(const void *v, void *out, void *scale, int B, int H,

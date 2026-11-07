@@ -74,6 +74,12 @@ class PrequantizedInt8Attention:
     Field-for-field the same as Kitchen's carrier, including the anchor the
     quantizer centred K on -- a producer claiming to emit these has to
     reproduce the anchor choice, not only the packed bytes.
+
+    ``v_scale_rows`` 0 is the global V carrier: one scale per (batch, KV head,
+    channel). A positive power of two declares chunk-scaled V: ``v_scale``
+    holds [batch, KV heads, ceil(keys / v_scale_rows), head_dim] scales, one
+    per block of that many keys, and only the ``*_chunked_v`` entry points
+    may read it.
     """
 
     q: torch.Tensor
@@ -87,6 +93,52 @@ class PrequantizedInt8Attention:
     attention_scale: float
     cta_k: int
     anchor_indices: torch.Tensor | None = None
+    v_scale_rows: int = 0
+
+
+def _attention_entry(library, name, quantized, route=None):
+    """The entry point that reads this carrier's V scales, and its extra args.
+
+    A chunk-scaled carrier handed to a global-scale entry point would read its
+    first block's scales as if they covered the sequence -- a plausible wrong
+    answer -- so a binary without the chunk-scaled symbols is an error here.
+    """
+    rows = int(getattr(quantized, 'v_scale_rows', 0) or 0)
+    if not rows:
+        return getattr(library, name), ()
+    entry = getattr(library, name + '_chunked_v', None)
+    if entry is None:
+        raise RuntimeError(
+            'the loaded H3 native library cannot read chunk-scaled V (%s)' % name
+        )
+    if 'sparse' not in name:
+        return entry, (rows,)
+    changes = getattr(route, 'v_block_changes', None)
+    if changes is None:
+        if (int(route.q_tile), int(route.kv_tile)) == (64, 32):
+            raise RuntimeError(
+                'chunk-scaled 64Q x 32KV attention needs an aligned route'
+            )
+        return entry, (rows, None, 0)
+    return entry, (rows, _ptr(changes), int(changes.shape[-1]))
+
+
+def chunk_scaled_v_is_available():
+    """Whether the loaded binary carries every chunk-scaled V entry point."""
+    try:
+        library = loader.load()
+    except loader.NativeUnavailableError:
+        return False
+    if not all(hasattr(library, name) for name in loader.CHUNK_SCALED_V_SYMBOLS):
+        return False
+    if not hasattr(library, 'h3_int8_align_route_v_blocks'):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    from . import selftest
+
+    # Like every other native path: proven on this GPU before it is used.
+    return selftest.chunk_scaled_v_check()
 
 
 @dataclass(frozen=True)
@@ -104,6 +156,9 @@ class BlockSparseRoute:
     q_tile: int
     kv_tile: int
     encoding: str = 'absolute'
+    # Set by align_route_to_v_blocks: per route row, the iterations where the
+    # chunk-scaled V block changes, then a sentinel. Encoding-independent.
+    v_block_changes: torch.Tensor | None = None
 
     def __post_init__(self):
         if self.encoding not in ('absolute', 'delta'):
@@ -232,6 +287,148 @@ def _runtime_sparse_route(quantized, route, *, validate_geometry):
     )
 
 
+def packed_route_group(q_tile, kv_tile, device=None):
+    """Routed tiles one packed kernel iteration consumes for this geometry.
+
+    Mirrors the launcher: 64Q x 32KV always runs the fine-route kernel (four
+    32-key subtiles per iteration); 64Q x 64KV runs the packed kernel (two
+    64-key subtiles) on SM86, SM89 and SM12x. Every other geometry walks one
+    tile per iteration and needs no alignment.
+    """
+    geometry = (int(q_tile), int(kv_tile))
+    if geometry == (64, 32):
+        return 4
+    if geometry == (64, 64):
+        major, minor = torch.cuda.get_device_capability(device)
+        if (major == 8 and minor in (6, 9)) or major == 12:
+            return 2
+    return 1
+
+
+def align_route_to_v_blocks(route, block_rows, group, kv_length):
+    """Pad a route so no packed iteration mixes chunk-scaled V blocks.
+
+    In every route row, each V scale block except the row's last present block
+    is made to contribute a multiple of ``group`` tiles by adding unselected
+    tiles of that block, nearest to an already selected tile first. Adding
+    keys only moves sparse attention towards dense. The packed kernels rely on
+    this: they check the block once per iteration and never split a product.
+    """
+    if group <= 1:
+        return route
+    kv_tile = int(route.kv_tile)
+    per_block = int(block_rows) // kv_tile
+    if per_block % group:
+        raise ValueError('V scale blocks must hold whole packed iterations')
+    if route.indices.is_cuda:
+        library = loader.load()
+        if hasattr(library, 'h3_int8_align_route_v_blocks'):
+            return _align_route_native(library, route, per_block, group, kv_length)
+    return _align_route_reference(route, per_block, group, kv_length)
+
+
+def _align_route_native(library, route, per_block, group, kv_length):
+    """One thread per route row; reads and writes the kernel's encoding."""
+    encoding = loader.route_encoding()
+    source = route if route.encoding == encoding else (
+        route.to_delta() if encoding == 'delta' else route.to_absolute())
+    indices = source.indices.contiguous()
+    counts = source.counts.contiguous()
+    batch_shape = indices.shape[:-1]
+    width = int(indices.shape[-1])
+    total = -(-int(kv_length) // int(route.kv_tile))
+    blocks = -(-total // per_block)
+    out_width = min(width + (group - 1) * blocks, max(width, total))
+    out_indices = torch.empty(*batch_shape, out_width, dtype=torch.int32, device=indices.device)
+    out_counts = torch.empty_like(counts)
+    change_width = blocks + 1  # at most blocks - 1 changes, plus the sentinel
+    out_changes = torch.empty(*batch_shape, change_width, dtype=torch.int32, device=indices.device)
+    delta = int(encoding == 'delta')
+    loader.check(
+        library.h3_int8_align_route_v_blocks(
+            _ptr(indices), _ptr(counts), _ptr(out_indices), _ptr(out_counts),
+            _ptr(out_changes), counts.numel(), width, out_width, change_width,
+            per_block, group, total, delta, delta, _stream(),
+        ),
+        'align_route_v_blocks',
+    )
+    return BlockSparseRoute(indices=out_indices, counts=out_counts,
+                            q_tile=route.q_tile, kv_tile=route.kv_tile,
+                            encoding=encoding, v_block_changes=out_changes)
+
+
+def _align_route_reference(route, per_block, group, kv_length):
+    """Row-by-row reference of the native pass (CPU tests).
+
+    Chunk-scaled V needs a binary that also carries the native pass, so this
+    only has to be exact, not fast: the same choice of padding tiles -- after
+    the run, then before it, then gaps inside it -- as h3_route_align.cu.
+    """
+    absolute = route.to_absolute()
+    batch_shape = absolute.indices.shape[:-1]
+    width = int(absolute.indices.shape[-1])
+    indices = absolute.indices.reshape(-1, width).tolist()
+    counts = absolute.counts.reshape(-1).tolist()
+    total = -(-int(kv_length) // int(route.kv_tile))
+    rows = []
+    change_rows = []
+    blocks = -(-total // per_block)
+    for row, count in zip(indices, counts):
+        tiles = row[:int(count)]
+        out = []
+        changes = []
+        i = 0
+        while i < len(tiles):
+            if i > 0:
+                changes.append(len(out) // group)
+            block = tiles[i] // per_block
+            j = i
+            while j < len(tiles) and tiles[j] // per_block == block:
+                j += 1
+            run = tiles[i:j]
+            need = 0 if j == len(tiles) else (-len(run)) % group
+            block_start = block * per_block
+            block_end = min(block_start + per_block, total)
+            above = min(need, block_end - 1 - run[-1])
+            need -= above
+            below = min(need, run[0] - block_start)
+            need -= below
+            out.extend(range(run[0] - below, run[0]))
+            out.append(run[0])
+            for previous, tile in zip(run, run[1:]):
+                gap = list(range(previous + 1, tile))[:need]
+                need -= len(gap)
+                out.extend(gap)
+                out.append(tile)
+            out.extend(range(run[-1] + 1, run[-1] + 1 + above))
+            i = j
+        rows.append(out)
+        change_rows.append(changes[:blocks] + [0x7FFFFFFF] * (blocks + 1 - len(changes[:blocks])))
+    new_width = max(width, max((len(r) for r in rows), default=0))
+    padded = [r + [0] * (new_width - len(r)) for r in rows]
+    device = absolute.indices.device
+    return BlockSparseRoute(
+        indices=torch.tensor(padded, dtype=torch.int32, device=device).reshape(
+            *batch_shape, new_width).contiguous(),
+        counts=torch.tensor([len(r) for r in rows], dtype=torch.int32, device=device).reshape(
+            batch_shape).contiguous(),
+        q_tile=route.q_tile,
+        kv_tile=route.kv_tile,
+        encoding='absolute',
+        v_block_changes=torch.tensor(change_rows, dtype=torch.int32, device=device).reshape(
+            *batch_shape, blocks + 1).contiguous(),
+    )
+
+
+def _align_for_carrier(quantized, route):
+    rows = int(getattr(quantized, 'v_scale_rows', 0) or 0)
+    if not rows:
+        return route
+    group = packed_route_group(route.q_tile, route.kv_tile, quantized.q.device)
+    with diagnostics.stage('v_block_route_align'):
+        return align_route_to_v_blocks(route, rows, group, int(quantized.k.shape[-2]))
+
+
 def _check_quantize_qk(*arguments):
     loader.check(loader.load().h3_int8_quantize_qk(*arguments), 'quantize_qk')
 
@@ -240,15 +437,15 @@ def _check_quantize_v(*arguments):
     loader.check(loader.load().h3_int8_quantize_v(*arguments), 'quantize_v')
 
 
-def _check_sparse_attention(*arguments):
-    loader.check(
-        loader.load().h3_int8_sparse_attention(*arguments), 'sparse attention'
-    )
+def _check_sparse_attention(*arguments, entry=None):
+    entry = entry or loader.load().h3_int8_sparse_attention
+    loader.check(entry(*arguments), 'sparse attention')
 
 
-def _check_sparse_attention_lse(*arguments):
+def _check_sparse_attention_lse(*arguments, entry=None):
+    entry = entry or loader.load().h3_int8_sparse_attention_lse
     loader.check(
-        loader.load().h3_int8_sparse_attention_lse(*arguments),
+        entry(*arguments),
         'sparse attention with LSE',
     )
 
@@ -456,12 +653,14 @@ def int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_HND):
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
     )
+    entry, extra = _attention_entry(library, 'h3_int8_dense_attention', quantized)
     loader.check(
-        library.h3_int8_dense_attention(
+        entry(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), quantized.cta_k, *geometry, *strides,
-            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], _stream(),
+            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], *extra,
+            _stream(),
         ),
         'dense attention',
     )
@@ -485,12 +684,16 @@ def packed_int8_attention_from_prequantized(quantized, *, output_layout=OUTPUT_H
         raise ValueError('packed dense attention requires a 64KV carrier and head_dim 128')
     library = loader.load()
     output, output_dtype, geometry, strides = _attention_geometry(quantized, output_layout)
+    entry, extra = _attention_entry(
+        library, 'h3_int8_packed_dense_attention', quantized
+    )
     loader.check(
-        library.h3_int8_packed_dense_attention(
+        entry(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
             _ptr(output), _ptr(quantized.q_scale), _ptr(quantized.k_scale),
             _ptr(quantized.v_scale), quantized.cta_k, *geometry, *strides,
-            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], _stream(),
+            quantized.attention_scale, _DTYPE_TO_CODE[output_dtype], *extra,
+            _stream(),
         ),
         'packed dense attention',
     )
@@ -509,12 +712,16 @@ def block_sparse_int8_attention_from_prequantized(
     route = _runtime_sparse_route(
         quantized, route, validate_geometry=validate_geometry
     )
+    route = _align_for_carrier(quantized, route)
     kernel_route = _validate_sparse_route(quantized, route)
 
     output, output_dtype, geometry, strides = _attention_geometry(
         quantized, output_layout
     )
     kv_tiles = kernel_route.indices.shape[-1]
+    entry, extra = _attention_entry(
+        library, 'h3_int8_sparse_attention', quantized, kernel_route
+    )
     with diagnostics.stage('sparse_attention_kernel'):
         _check_sparse_attention(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
@@ -525,7 +732,7 @@ def block_sparse_int8_attention_from_prequantized(
             *geometry, *strides,
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
-            _stream(),
+            *extra, _stream(), entry=entry,
         )
     return _finish(quantized, output)
 
@@ -541,6 +748,7 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
     route = _runtime_sparse_route(
         quantized, route, validate_geometry=validate_geometry
     )
+    route = _align_for_carrier(quantized, route)
     kernel_route = _validate_sparse_route(quantized, route)
 
     output, output_dtype, geometry, strides = _attention_geometry(
@@ -551,6 +759,9 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
         dtype=torch.float32, device=quantized.q.device,
     )
     kv_tiles = kernel_route.indices.shape[-1]
+    entry, extra = _attention_entry(
+        loader.load(), 'h3_int8_sparse_attention_lse', quantized, kernel_route
+    )
     with diagnostics.stage('sparse_attention_kernel'):
         _check_sparse_attention_lse(
             _ptr(quantized.q), _ptr(quantized.k), _ptr(quantized.v),
@@ -560,7 +771,7 @@ def block_sparse_int8_attention_with_lse_from_prequantized(
             kv_tiles, route.q_tile, route.kv_tile, *geometry, *strides,
             quantized.q_scale.stride(0), quantized.q_scale.stride(1),
             quantized.attention_scale, _DTYPE_TO_CODE[output_dtype],
-            _stream(),
+            *extra, _stream(), entry=entry,
         )
     return _finish(quantized, output), lse
 
@@ -593,6 +804,8 @@ def block_sparse_int8_attention_tiles_from_prequantized(
         )
     if (int(route.q_tile), int(route.kv_tile)) != (64, 64) or quantized.cta_k != 64:
         raise ValueError('per-tile KV lengths are built for 64Q x 64KV only')
+    if quantized.v_scale_rows:
+        raise ValueError('per-tile KV lengths have no chunk-scaled V traversal')
     kernel_route = _validate_sparse_route(quantized, route)
     kv_tile_len = kv_tile_len.to(device=quantized.q.device, dtype=torch.int32).contiguous()
     kv_tiles = (int(quantized.k.shape[-2]) + 63) // 64

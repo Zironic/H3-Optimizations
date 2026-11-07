@@ -89,6 +89,7 @@ from .plan import (
     FUSED_QKV_PRESERVE_BF16,
     H3OptimizationPlan,
     V_MEMORY_RETAIN,
+    v_memory_without_chunk_scales,
     PLAN_KEY,
     SPARSE_BACKEND_AUTO,
     SPARSE_BACKEND_FLEX,
@@ -462,7 +463,7 @@ def _resolve_dense(plan, model, inventory, environment=None):
             dense.backend,
             chunk_rows=qkv_chunk_rows,
             projection_mode=_streamed_projection_mode(qkv, inventory),
-            v_mode=memory.attention_v_memory,
+            v_mode=v_memory_without_chunk_scales(memory.attention_v_memory),
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:
         backend = ChunkedKitchenAttentionBackend()
@@ -678,7 +679,7 @@ def _resolve_sparse(plan, environment, inventory):
             v_mode=(
                 V_MEMORY_RETAIN
                 if plan.memory is None
-                else plan.memory.attention_v_memory
+                else v_memory_without_chunk_scales(plan.memory.attention_v_memory)
             ),
         )
     elif qkv.provider_id in _BOUNDED_QKV_PROVIDERS:

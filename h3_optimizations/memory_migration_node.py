@@ -18,7 +18,7 @@ from .plan import (
     FUSED_QKV_OFF,
     FUSED_QKV_PRESERVE_BF16,
     KITCHEN_V_MEMORY_RETAIN,
-    KITCHEN_V_MEMORY_TWO_PASS,
+    V_MEMORY_CHUNK_SCALED,
     MAX_CHUNK_ROWS,
     MIN_CHUNK_ROWS,
     MLP_MEMORY_AUTO,
@@ -71,10 +71,12 @@ EMBEDDING_MEMORY_MODE_OPTIONS = (
 )
 
 KITCHEN_V_MEMORY_MODE_RETAIN = 'Standard'
-KITCHEN_V_MEMORY_MODE_TWO_PASS = 'Lower VRAM (slower)'
+# The label is serialized in workflows, so it keeps its original spelling. It
+# requests chunk-scaled V; paths without it run two-pass V instead.
+KITCHEN_V_MEMORY_MODE_LOWER_VRAM = 'Lower VRAM (slower)'
 KITCHEN_V_MEMORY_MODE_OPTIONS = (
     KITCHEN_V_MEMORY_MODE_RETAIN,
-    KITCHEN_V_MEMORY_MODE_TWO_PASS,
+    KITCHEN_V_MEMORY_MODE_LOWER_VRAM,
 )
 
 
@@ -149,7 +151,7 @@ def _memory_request_for_modes(
 
     v_memory_requests = {
         KITCHEN_V_MEMORY_MODE_RETAIN: KITCHEN_V_MEMORY_RETAIN,
-        KITCHEN_V_MEMORY_MODE_TWO_PASS: KITCHEN_V_MEMORY_TWO_PASS,
+        KITCHEN_V_MEMORY_MODE_LOWER_VRAM: V_MEMORY_CHUNK_SCALED,
     }
     try:
         v_memory_request = v_memory_requests[kitchen_v_memory_mode]
@@ -321,8 +323,11 @@ class H3MemoryOptimization(io.ComfyNode):
                     default=KITCHEN_V_MEMORY_MODE_RETAIN,
                     advanced=True,
                     tooltip=(
-                        'Standard prioritizes speed. Lower VRAM uses additional '
-                        'attention work to reduce peak memory.'
+                        'Standard prioritizes speed. Lower VRAM avoids retaining '
+                        'the full value tensor to reduce peak memory. INT8 '
+                        'attention quantizes each value chunk separately, which '
+                        'may change output slightly; other supported attention '
+                        'paths project values a second time instead.'
                     ),
                 ),
             ],

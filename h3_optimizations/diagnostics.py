@@ -143,6 +143,7 @@ STAGE_NAMES = (
     'v_retention_copy',
     'carrier_finalize',
     'sparse_route',
+    'v_block_route_align',
     'sparse_carrier_prepare',
     'sparse_attention_kernel',
     'dense_attention_kernel',

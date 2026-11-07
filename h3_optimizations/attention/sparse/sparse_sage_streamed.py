@@ -28,7 +28,12 @@ import torch
 from ... import diagnostics
 from ...normalized_rows import attention_output_buffer
 from ...qkv.formats import describe_linear
-from ...plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
+from ...plan import (
+    V_MEMORY_RETAIN,
+    V_MEMORY_TWO_PASS,
+    V_MEMORY_REQUESTS,
+    v_memory_without_chunk_scales,
+)
 from ...qkv.streamed import (
     PROJECTION_NATIVE,
     create_held_qkv,
@@ -417,9 +422,11 @@ class StreamedSparseSageQKVProjector:
     ):
         self.spec = spec
         self.projection_mode = projection_mode
-        if v_mode not in (V_MEMORY_RETAIN, V_MEMORY_TWO_PASS):
+        if v_mode not in V_MEMORY_REQUESTS:
             raise ValueError('unknown sparse Sage V mode %r' % v_mode)
         self.requested_v_mode = v_mode
+        # Sage carriers have no chunk scales; Lower VRAM stages V in two passes.
+        v_mode = v_memory_without_chunk_scales(v_mode)
         # Resolve against what the spec can do, so v_mode always names what
         # will happen; status reads this field.
         parameters = getattr(spec, "v_staging_parameters", None)

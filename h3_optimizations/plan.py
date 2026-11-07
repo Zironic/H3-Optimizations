@@ -89,9 +89,14 @@ SPARSE_BACKEND_REQUESTS = (
 
 V_MEMORY_RETAIN = 'retain'
 V_MEMORY_TWO_PASS = 'two_pass'
+# What Lower VRAM requests: Kitchen INT8 quantizes each V projection chunk
+# against its own scale, for two-pass memory without the second V projection.
+# Carriers without chunk scales run two-pass V instead.
+V_MEMORY_CHUNK_SCALED = 'chunk_scaled'
 V_MEMORY_REQUESTS = (
     V_MEMORY_RETAIN,
     V_MEMORY_TWO_PASS,
+    V_MEMORY_CHUNK_SCALED,
 )
 # Two-pass V started out Kitchen-only. It now also covers the Sage FP8
 # carriers, so the neutral names above are canonical; these aliases keep the
@@ -146,6 +151,11 @@ EARLY_SCHEDULE_OPTIONS = (
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_RAMP,
 )
+
+
+def v_memory_without_chunk_scales(request):
+    '''Use the existing two-pass path when chunk-scaled V is unsupported.'''
+    return V_MEMORY_TWO_PASS if request == V_MEMORY_CHUNK_SCALED else request
 
 
 def _validate_sparse_budget(name, value):

@@ -105,6 +105,29 @@ python benchmarks/bench_fused_norm_adaln_quantize.py `
 
 ## Building
 
+Lower VRAM's chunk-scaled V uses four optional ABI-4 entry points:
+`h3_int8_dense_attention_chunked_v`, `h3_int8_packed_dense_attention_chunked_v`,
+`h3_int8_sparse_attention_chunked_v`, and `h3_int8_sparse_attention_lse_chunked_v`.
+They consume per-channel scales laid out as `[batch, KV heads, chunks, 128]`.
+Chunks must contain a power-of-two number of rows, at least 128. The new
+multi-chunk consumers support unmasked H3 attention with head dimension 128.
+The original entry points and global-scale carriers remain unchanged.
+
+The packed sparse kernels sum several routed subtiles per iteration, so an
+iteration must not span two V chunks. `h3_int8_align_route_v_blocks` pads each
+route row so every chunk except the last contributes whole iterations, adding
+unselected tiles of that chunk (after its run, before it, then in gaps), and
+writes the iterations where the chunk changes. The sparse `_chunked_v` entry
+points take that list; the fine-route kernel rescales between inner loops
+there instead of checking every iteration. Builds without these symbols, or
+GPUs whose `selftest.chunk_scaled_v_check` fails (chunked kernels must
+reproduce the global ones bit for bit when all chunk scales are equal), use
+the two-pass producer for Lower VRAM instead.
+
+GPU correctness tests are in `tests/test_chunk_scaled_v_cuda.py`. Real block
+comparisons are in H3-Extended's `benchmarks/bench_chunk_scaled_v.py`; pass the
+candidate pack explicitly and verify its recorded native path and hash.
+
 ```
 cmake -S native -B native/build -G Ninja
 cmake --build native/build --config Release

@@ -23,6 +23,7 @@
 #pragma once
 
 #include "qk_int_sv_i8_sparse_cuda.cuh"
+#include "chunked_v_scale.cuh"
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
           uint32_t TILES_PER_SUB>
@@ -95,7 +96,7 @@ __device__ __forceinline__ void update_mdo_i32_u8_packed(
 }
 
 template <uint32_t SUB_K, typename DTypeOut, bool return_lse,
-          uint32_t MIN_BLOCKS, bool DENSE = false>
+          uint32_t MIN_BLOCKS, bool DENSE = false, bool chunked_v = false>
 __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kernel(
     int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V,
     DTypeOut *__restrict__ O, float *__restrict__ Lse,
@@ -110,12 +111,15 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     const uint32_t stride_h_o, const uint32_t stride_bz_q_scale,
     const uint32_t stride_h_q_scale, float sm_scale,
     const int32_t *__restrict__ BlockLut,
-    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride) {
+    const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride,
+    const uint32_t v_scale_blocks = 1, const uint32_t v_scale_shift = 0) {
   constexpr uint32_t CTA_Q = 64;
   constexpr uint32_t CTA_K = 128;
   constexpr uint32_t WARP_Q = 16;
   constexpr uint32_t head_dim = 128;
   static_assert(SUB_K == 32 || SUB_K == 64, "SUB_K must be 32 or 64");
+  static_assert(!chunked_v || SUB_K >= 32,
+                "chunk-scaled V needs whole subtiles per 32-key P x V group");
   constexpr uint32_t N_SUB = CTA_K / SUB_K;
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = 1;
@@ -323,6 +327,21 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
                                 CTA_K>(&ptr, offset, stride_d_v, smem_V);
   };
 
+  // Chunk-scaled V (chunked_v): the block the P x V accumulators are
+  // expressed in, and this CTA's [blocks, head_dim] scales on demand.
+  uint32_t v_block = 0;
+  auto v_scale_head = [&]() -> const float * {
+    return V_scale +
+           static_cast<int64_t>(batch_id * (num_qo_heads / num_kv_groups) +
+                                kv_head) *
+               v_scale_blocks * head_dim;
+  };
+  // Routes must be block-aligned: within each route row, every V scale
+  // block except the last contributes a multiple of N_SUB entries, so an
+  // iteration never mixes blocks (int8_attention.align_route_to_v_blocks).
+  // The block check then sits at the iteration top, away from P x V: a check
+  // beside P x V cost this register-bound loop its copy/MMA overlap.
+
   uint32_t cur[N_SUB];
   uint32_t nxt[N_SUB];
   decode(cur);
@@ -353,6 +372,10 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
   cp_async::commit_group();
 
   for (uint32_t iter = 0; iter + 1 < num_iterations; iter++) {
+    if constexpr (chunked_v) {
+      chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+          RO, v_scale_head(), v_block, (cur[0] * SUB_K) >> v_scale_shift);
+    }
     cp_async::wait_group<1>();
     __syncthreads();
     compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
@@ -374,8 +397,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     cp_async::wait_group<1>();
     __syncthreads();
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V,
+                    V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
     __syncthreads();
 
     load_V(nxt);
@@ -386,6 +409,10 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     }
   }
 
+  if constexpr (chunked_v) {
+    chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+        RO, v_scale_head(), v_block, (cur[0] * SUB_K) >> v_scale_shift);
+  }
   // Final iteration: float path with the ragged-sequence and missing-subtile
   // masks. Scores are pre-scaled because the dequant scale varies by subtile.
   {
@@ -426,8 +453,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
     cp_async::wait_group<0>();
     __syncthreads();
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
-                    num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS, RS_u8, RO);
+                    num_tiles_v, swizzle_mode_V,
+                    V_SMEM_STRIDE / PACK_SIZE_V>(smem_V, RS, RS_u8, RO);
     __syncthreads();
   }
 
@@ -436,8 +463,10 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void qk_int_sv_i8_packed_attn_kern
   {
     float v_scale[4];
     const float *V_scale_base_ptr =
-        V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
-        kv_head * head_dim + (lane_id % 4) * 2;
+        chunked_v
+            ? chunked_v_epilogue<head_dim>(v_scale_head(), v_block)
+            : V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
+                  kv_head * head_dim + (lane_id % 4) * 2;
 #pragma unroll
     for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
       ((float2 *)v_scale)[0] = *((const float2 *)(V_scale_base_ptr + fv * 16));

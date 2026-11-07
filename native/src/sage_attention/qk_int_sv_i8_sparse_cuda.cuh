@@ -42,6 +42,7 @@
 #include "permuted_smem.cuh"
 
 #include "attn_utils.cuh"
+#include "chunked_v_scale.cuh"
 
 #define PACK_SIZE_QK 16 // as if it is int8
 #define PACK_SIZE_V 16  // int8
@@ -66,7 +67,7 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           bool fuse_v_scale = false, bool fuse_v_mean = false,
           bool use_pv_fp16_accu = false,
           bool fuse_fp32_probabilities = true,
-          bool per_tile_kv_len = false>
+          bool per_tile_kv_len = false, bool chunked_v = false>
 #if defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \
      __CUDA_ARCH__ == 1200)
@@ -95,7 +96,8 @@ void qk_int_sv_i8_sparse_attn_kernel(
     float sm_scale,
     const int32_t *__restrict__ BlockLut,
     const int32_t *__restrict__ ValidBlockNum, const uint32_t lut_stride,
-    const int32_t *__restrict__ KvTileLen) {
+    const int32_t *__restrict__ KvTileLen,
+    const uint32_t v_scale_blocks = 1, const uint32_t v_scale_shift = 0) {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4,
                 "DTypeQK must be int8 or int4");
@@ -420,6 +422,15 @@ void qk_int_sv_i8_sparse_attn_kernel(
   // epilogue exactly where the dense kernel has it. The running sum turns each
   // delta back into the absolute block used by the pointer seeks below.
   // whatever encoding a particular backend happened to want.
+  // Chunk-scaled V (chunked_v): the block the P x V accumulators are
+  // expressed in, and this CTA's [blocks, head_dim] scales on demand.
+  uint32_t v_block = 0;
+  auto v_scale_head = [&]() -> const float * {
+    return V_scale +
+           static_cast<int64_t>(batch_id * (num_qo_heads / num_kv_groups) +
+                                head_id / num_kv_groups) *
+               v_scale_blocks * head_dim;
+  };
   uint32_t load_block = static_cast<uint32_t>(lut_row[0]);
   seek_kv_block(load_block);
 
@@ -557,7 +568,9 @@ void qk_int_sv_i8_sparse_attn_kernel(
       }
     }
 
-    // The pointer seek and K transfer above already target this routed tile.
+    // The pointer seek and K transfer above already target this routed tile;
+    // shared memory still holds V of the tile before it.
+    const uint32_t sv_block = load_block;
     load_block += static_cast<uint32_t>(lut_row[iter]);
     dequant_scale =
         q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
@@ -567,6 +580,10 @@ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<1>();
     __syncthreads();
 
+    if constexpr (chunked_v) {
+      chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+          RO, v_scale_head(), v_block, (sv_block * CTA_K) >> v_scale_shift);
+    }
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
@@ -669,6 +686,7 @@ void qk_int_sv_i8_sparse_attn_kernel(
     }
 
     // The pointer seek and K transfer above already target the final tile.
+    const uint32_t sv_block = load_block;
     load_block += static_cast<uint32_t>(lut_row[num_iterations - 1]);
     dequant_scale =
         q_scale * K_scale[k_scale_idx + load_block * k_scale_advance_offset];
@@ -678,6 +696,10 @@ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<1>();
     __syncthreads();
 
+    if constexpr (chunked_v) {
+      chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+          RO, v_scale_head(), v_block, (sv_block * CTA_K) >> v_scale_shift);
+    }
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
@@ -768,6 +790,10 @@ void qk_int_sv_i8_sparse_attn_kernel(
     cp_async::wait_group<0>();
     __syncthreads();
 
+    if constexpr (chunked_v) {
+      chunked_v_enter<num_tiles_q, num_tiles_v, head_dim>(
+          RO, v_scale_head(), v_block, (load_block * CTA_K) >> v_scale_shift);
+    }
     compute_int8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k,
                     num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
         smem_V, RS, RS_u8, RO);
@@ -807,13 +833,17 @@ void qk_int_sv_i8_sparse_attn_kernel(
   // ! here we just implement the case for fp32 acumulation
   if constexpr (fuse_v_scale) {
     float v_scale[4];
-    float *V_scale_base_ptr =
-        V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
-        (head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
+    const float *V_scale_base_ptr =
+        chunked_v
+            ? chunked_v_epilogue<head_dim>(v_scale_head(), v_block)
+            : V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim +
+                  (head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
 #pragma unroll
     for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-      ((float2 *)v_scale)[0] = *((float2 *)(V_scale_base_ptr + fv * 16));
-      ((float2 *)v_scale)[1] = *((float2 *)(V_scale_base_ptr + fv * 16 + 8));
+      ((float2 *)v_scale)[0] =
+          *((const float2 *)(V_scale_base_ptr + fv * 16));
+      ((float2 *)v_scale)[1] =
+          *((const float2 *)(V_scale_base_ptr + fv * 16 + 8));
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll

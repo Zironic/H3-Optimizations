@@ -235,3 +235,112 @@ class TwoPassVCarrier:
         if covered != self.sequence:
             raise VStagingError('V chunks do not cover the carrier sequence')
         return self.v_int8, self.scale
+
+
+def chunk_scaled_block_rows_ok(block_rows):
+    """Block sizes the chunk-scaled kernels accept: a power of two >= 128."""
+    block_rows = int(block_rows)
+    return block_rows >= 128 and block_rows & (block_rows - 1) == 0
+
+
+class ChunkScaledVCarrier(TwoPassVCarrier):
+    """Single-pass V carrier with one scale per block of ``block_rows`` keys.
+
+    Each projection chunk is quantized against its own per-channel maximum
+    the moment it is produced, so neither a full-sequence BF16 V nor a second
+    V projection is needed. The scales are [batch, heads, blocks, head_dim];
+    the carrier declares ``v_scale_rows = block_rows`` and only the
+    chunk-scaled attention entry points may read it. Chunks must arrive in
+    order and each must be exactly one block (the last may be short).
+    """
+
+    def __init__(self, spec, block_rows, *, backend=BACKEND_NATIVE):
+        super().__init__(spec, backend=backend)
+        if not chunk_scaled_block_rows_ok(block_rows):
+            raise VStagingError(
+                'chunk-scaled V needs a power-of-two block of at least 128 '
+                'rows, got %r' % (block_rows,)
+            )
+        self.block_rows = int(block_rows)
+        self.blocks = -(-self.sequence // self.block_rows)
+        self.block_scales = torch.empty(
+            self.batch,
+            self.heads,
+            self.blocks,
+            self.head_dim,
+            dtype=torch.float32,
+            device=spec.device,
+        )
+        # The native quantizer reads one contiguous [B*H*D] scale per chunk.
+        self.scale = torch.empty(
+            self.batch * self.heads * self.head_dim,
+            dtype=torch.float32,
+            device=spec.device,
+        )
+        self.v_int8 = torch.empty(
+            self.batch * self.heads * self.head_dim,
+            self.padded,
+            dtype=torch.int8,
+            device=spec.device,
+        )
+        _zero_padding(self.v_int8, self.sequence)
+
+    def finalize_scale(self):
+        raise VStagingError('chunk-scaled V has no whole-sequence scale')
+
+    def quantize(self, v_chunk, row_start):
+        self._check_chunk(v_chunk)
+        row_start = int(row_start)
+        rows = int(v_chunk.shape[2])
+        expected = self._covered[-1][1] if self._covered else 0
+        if (
+            row_start != expected
+            or row_start % self.block_rows
+            or rows != min(self.block_rows, self.sequence - row_start)
+        ):
+            raise VStagingError(
+                'chunk-scaled V chunks must be whole %d-row blocks, in order'
+                % self.block_rows
+            )
+        self.amax.zero_()
+        if self.backend == BACKEND_TORCH:
+            _torch_update(self.amax, v_chunk)
+        else:
+            batch, heads, rows, head_dim = v_chunk.shape
+            _check(
+                self.library,
+                self.library.h3_int8_v_amax_chunk(
+                    _ptr(v_chunk), _ptr(self.amax), batch, heads, rows,
+                    head_dim, v_chunk.stride(0), v_chunk.stride(1),
+                    v_chunk.stride(2), _DTYPE_TO_CODE[v_chunk.dtype],
+                    _stream(),
+                ),
+                'v_amax_chunk',
+            )
+        torch.mul(self.amax.view(-1), 1.0 / 127.0, out=self.scale)
+        self.scale.clamp_(min=1e-12)
+        self.block_scales[:, :, row_start // self.block_rows].copy_(
+            self.scale.view(self.batch, self.heads, self.head_dim)
+        )
+        if self.backend == BACKEND_TORCH:
+            _torch_quantize(v_chunk, self.v_int8, self.scale, row_start)
+        else:
+            batch, heads, _, head_dim = v_chunk.shape
+            _check(
+                self.library,
+                self.library.h3_int8_quantize_v_chunk_into(
+                    _ptr(v_chunk), _ptr(self.v_int8), _ptr(self.scale),
+                    batch, heads, rows, row_start, head_dim, self.padded,
+                    v_chunk.stride(0), v_chunk.stride(1), v_chunk.stride(2),
+                    _DTYPE_TO_CODE[v_chunk.dtype], _stream(),
+                ),
+                'quantize_v_chunk_into',
+            )
+        self._covered.append((row_start, row_start + rows))
+
+    def finish(self):
+        if not self._covered or self._covered[-1][1] != self.sequence:
+            raise VStagingError('V chunks do not cover the carrier sequence')
+        self.amax = None
+        self.scale = None
+        return self.v_int8, self.block_scales.view(-1)

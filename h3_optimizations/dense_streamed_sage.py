@@ -16,7 +16,12 @@ from .attention.sage_v_staging import (
     TwoPassSageVCarrier,
 )
 from .normalized_rows import attention_output_buffer
-from .plan import V_MEMORY_RETAIN, V_MEMORY_TWO_PASS
+from .plan import (
+    V_MEMORY_RETAIN,
+    V_MEMORY_TWO_PASS,
+    V_MEMORY_REQUESTS,
+    v_memory_without_chunk_scales,
+)
 from .qkv.streamed import (
     create_held_qkv,
     project_kv_hnd,
@@ -88,9 +93,11 @@ class StreamedDenseSageQKVProjector:
         self.backend = backend
         self.chunk_rows = int(chunk_rows)
         self.projection_mode = projection_mode
-        if v_mode not in (V_MEMORY_RETAIN, V_MEMORY_TWO_PASS):
+        if v_mode not in V_MEMORY_REQUESTS:
             raise ValueError('unknown dense Sage V mode %r' % v_mode)
         self.requested_v_mode = v_mode
+        # Sage carriers have no chunk scales; Lower VRAM stages V in two passes.
+        v_mode = v_memory_without_chunk_scales(v_mode)
         # Resolve the request against what this architecture can actually do,
         # so v_mode always names what will happen. Status reads this field, and
         # a request the backend declined must not read back as granted.

@@ -30,6 +30,7 @@ from h3_optimizations.dense_streamed_sage import (  # noqa: E402
     StreamedDenseSageQKVProjector,
 )
 from h3_optimizations.plan import (  # noqa: E402
+    V_MEMORY_CHUNK_SCALED,
     V_MEMORY_RETAIN,
     V_MEMORY_TWO_PASS,
 )
@@ -71,6 +72,16 @@ class SparseSageVModeTests(unittest.TestCase):
         )
 
         self.assertEqual(projector.requested_v_mode, V_MEMORY_TWO_PASS)
+        self.assertEqual(projector.v_mode, V_MEMORY_TWO_PASS)
+
+    def test_lower_vram_request_runs_two_pass(self):
+        # Lower VRAM requests chunk-scaled V, which Sage carriers cannot
+        # hold; the same memory saving comes from staging V in two passes.
+        projector = StreamedSparseSageQKVProjector(
+            _spec('fp8'), v_mode=V_MEMORY_CHUNK_SCALED
+        )
+
+        self.assertEqual(projector.requested_v_mode, V_MEMORY_CHUNK_SCALED)
         self.assertEqual(projector.v_mode, V_MEMORY_TWO_PASS)
 
     def test_fp16_v_spec_declines_and_reports_retain(self):
@@ -123,6 +134,17 @@ class DenseSageVModeTests(unittest.TestCase):
             v_mode=V_MEMORY_TWO_PASS,
         )
 
+        self.assertEqual(projector.v_mode, V_MEMORY_TWO_PASS)
+
+    def test_lower_vram_request_runs_two_pass(self):
+        projector = StreamedDenseSageQKVProjector(
+            _dense_backend((2.25, 64)),
+            chunk_rows=128,
+            projection_mode='native',
+            v_mode=V_MEMORY_CHUNK_SCALED,
+        )
+
+        self.assertEqual(projector.requested_v_mode, V_MEMORY_CHUNK_SCALED)
         self.assertEqual(projector.v_mode, V_MEMORY_TWO_PASS)
 
     def test_backend_without_staging_support_reports_retain(self):

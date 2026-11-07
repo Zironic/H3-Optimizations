@@ -23,7 +23,7 @@ from h3_optimizations.aimdo_limiter import H3AIMDOResidencyLimiter  # noqa: E402
 from h3_optimizations.memory_migration_node import (  # noqa: E402
     H3MemoryOptimization,
     KITCHEN_V_MEMORY_MODE_RETAIN,
-    KITCHEN_V_MEMORY_MODE_TWO_PASS,
+    KITCHEN_V_MEMORY_MODE_LOWER_VRAM,
     PRECISION_MODE_ALLOW_FP8,
     PRECISION_MODE_AUTO,
     PRECISION_MODE_BF16,
@@ -59,7 +59,7 @@ from h3_optimizations.plan import (  # noqa: E402
     QKV_STREAMING_FORCED,
     QKV_STREAMING_OFF,
     KITCHEN_V_MEMORY_RETAIN,
-    KITCHEN_V_MEMORY_TWO_PASS,
+    V_MEMORY_CHUNK_SCALED,
 )
 from h3_optimizations.public_nodes import H3OptimizationsExtension  # noqa: E402
 from h3_optimizations.vsa.node import H3VSAAttention  # noqa: E402
@@ -110,16 +110,16 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(request.qkv_streaming, QKV_STREAMING_AUTO)
         self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_RETAIN)
 
-    def test_two_pass_v_mode_is_explicit(self):
+    def test_lower_vram_requests_chunk_scaled_v(self):
         request = _memory_request_for_modes(
             fused_qkv='auto',
             mlp_memory='auto',
             chunk_rows=2048,
             precision_mode=PRECISION_MODE_PRESERVE_NATIVE,
             qkv_streaming_mode=QKV_STREAMING_MODE_AUTO,
-            kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_TWO_PASS,
+            kitchen_v_memory_mode=KITCHEN_V_MEMORY_MODE_LOWER_VRAM,
         )
-        self.assertEqual(request.attention_v_memory, KITCHEN_V_MEMORY_TWO_PASS)
+        self.assertEqual(request.attention_v_memory, V_MEMORY_CHUNK_SCALED)
 
     def test_streaming_forced_claims_attention(self):
         request = _memory_request_for_modes(
@@ -218,7 +218,10 @@ class PublicNodeTests(unittest.TestCase):
         self.assertEqual(attention_memory.display_name, 'Attention memory mode')
         self.assertEqual(
             attention_memory.options,
-            ['Standard', 'Lower VRAM (slower)'],
+            [
+                'Standard',
+                'Lower VRAM (slower)',
+            ],
         )
         self.assertEqual(attention_memory.default, KITCHEN_V_MEMORY_MODE_RETAIN)
         visible_text = ' '.join(

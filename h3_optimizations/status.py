@@ -67,6 +67,8 @@ def format_qkv_execution(status):
     """
     text = _format_qkv_execution(status)
     qkv = status.get('fused_qkv') or {}
+    if qkv.get('v_memory') == 'chunk_scaled':
+        return '%s; chunk-scaled V' % text
     if qkv.get('v_memory') == 'two_pass' and 'two-pass V' not in text:
         text = text.replace(
             'retained native Sage K/V',
@@ -244,13 +246,16 @@ def _mark_runtime_fallback(qkv, line):
 def _v_memory_notice(qkv):
     '''Report a Lower VRAM request the active attention path cannot honour.
 
-    Kitchen INT8 and compatible Sage FP8 projectors can stage V in two passes.
-    Other attention paths retain V, so staying silent would leave the readout
+    Kitchen INT8 quantizes V per chunk, and it and compatible Sage FP8
+    projectors can stage V in two passes; either honours the request. Other
+    attention paths retain V, so staying silent would leave the readout
     implying a saving that never happened.
     '''
-    if qkv.get('v_memory_requested') != 'two_pass':
+    requested = qkv.get('v_memory_requested')
+    actual = qkv.get('v_memory')
+    if requested not in ('chunk_scaled', 'two_pass'):
         return None
-    if qkv.get('v_memory') == 'two_pass':
+    if actual in ('chunk_scaled', 'two_pass'):
         return None
     return (
         'Attention memory mode: Lower VRAM requested but not available on '

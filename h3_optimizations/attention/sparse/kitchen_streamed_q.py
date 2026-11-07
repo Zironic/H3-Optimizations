@@ -28,6 +28,7 @@ from ...kitchen_qkv import (
     CHUNK_ROWS,
     PRODUCER_ABI_VERSION,
     V_MODE_TWO_PASS,
+    V_MODE_CHUNK_SCALED,
     ChunkedKitchenQKVProjector,
     _native_bf16_format,
     _project_anchor_samples,
@@ -258,10 +259,15 @@ def _run_streamed_sparse_kitchen_qkv(
         del anchor
 
         staging = None
+        chunked_v = None
         if projector.v_mode == V_MODE_TWO_PASS:
             from ...native.v_staging import TwoPassVCarrier
 
             staging = TwoPassVCarrier(spec)
+        elif projector.v_mode == V_MODE_CHUNK_SCALED:
+            from ...native.v_staging import ChunkScaledVCarrier
+
+            chunked_v = ChunkScaledVCarrier(spec, chunk_rows)
         retained_v = None
         kv_tiles = (sequence + kv_tile - 1) // kv_tile
         k_summary = x.new_empty(
@@ -272,7 +278,7 @@ def _run_streamed_sparse_kitchen_qkv(
         for start in range(0, sequence, chunk_rows):
             end = min(start + chunk_rows, sequence)
             k, v = project_kv_hnd(held, x, rope_freqs, start, end)
-            if staging is None and retained_v is None:
+            if staging is None and chunked_v is None and retained_v is None:
                 retained_v = v.new_empty(shape)
             kitchen.quantize_int8_attention_k_chunk(
                 producer,
@@ -285,14 +291,20 @@ def _run_streamed_sparse_kitchen_qkv(
             k_summary[
                 ..., k_start : k_start + int(k_mean.shape[-2]), :
             ].copy_(k_mean)
-            if staging is None:
+            if chunked_v is not None:
+                with diagnostics.stage("v_carrier_pack"):
+                    chunked_v.quantize(v, start)
+            elif staging is None:
                 retained_v[..., start:end, :].copy_(v)
             else:
                 with diagnostics.stage("v_amax_update"):
                     staging.update(v)
             del k_mean, k, v
 
-        if staging is None:
+        if chunked_v is not None:
+            producer.v, producer.v_scale = chunked_v.finish()
+            producer.v_scale_rows = chunked_v.block_rows
+        elif staging is None:
             kitchen.quantize_int8_attention_v(producer, retained_v)
             del retained_v
         else:

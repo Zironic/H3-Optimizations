@@ -80,6 +80,7 @@ add_library(h3_int8_attention SHARED
     src/convrot_quantize.cu
     src/h3_fused_q_cutlass.cu
     src/h3_threshold_route.cu
+    src/h3_route_align.cu
     src/sage_attention/sage_attn_launcher.cu
     src/sage_attention/sage_attn_sparse_launcher.cu
     src/sage_attention/quant_qk_int8.cu

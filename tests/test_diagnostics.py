@@ -158,6 +158,7 @@ class StageCoverageTests(unittest.TestCase):
         'qk_carrier_pack': 'native/producer.py',
         'v_carrier_pack': 'native/producer.py',
         'sparse_attention_kernel': 'native/int8_attention.py',
+        'v_block_route_align': 'native/int8_attention.py',
         'dense_attention_kernel': 'attention/sparse/kitchen_streamed_q.py',
         'full_carrier_pack': 'attention/sparse/kitchen_sparse.py',
         'sparse_route': 'attention/sparse/kitchen_sparse.py',

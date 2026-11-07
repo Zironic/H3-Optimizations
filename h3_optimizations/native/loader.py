@@ -30,7 +30,7 @@ import torch
 ABI_VERSION = 4
 
 _LIBRARY_NAMES = {
-    'Windows': 'h3_int8_attention_v9.dll',
+    'Windows': 'h3_int8_attention_v10.dll',
     'Linux': 'libh3_int8_attention.so',
     'Darwin': 'libh3_int8_attention.dylib',
 }
@@ -107,6 +107,14 @@ def _describe_absence(searched):
         'cmake --build native/build --config Release'
         % '\n  '.join(str(path) for path in searched)
     )
+
+
+CHUNK_SCALED_V_SYMBOLS = (
+    'h3_int8_dense_attention_chunked_v',
+    'h3_int8_packed_dense_attention_chunked_v',
+    'h3_int8_sparse_attention_chunked_v',
+    'h3_int8_sparse_attention_lse_chunked_v',
+)
 
 
 def _bind(library):
@@ -192,6 +200,28 @@ def _bind(library):
     else:
         fused_norm_adaln.restype = i
         fused_norm_adaln.argtypes = [p] * 6 + [i64] * 2 + [f, i, i, sz]
+
+    # Additive to ABI 4: chunk-scaled V. Each mirrors its base entry point
+    # with the block size inserted before the stream.
+    for name in CHUNK_SCALED_V_SYMBOLS:
+        try:
+            base = getattr(library, name[: -len('_chunked_v')])
+            chunked = getattr(library, name)
+        except AttributeError:
+            continue
+        chunked.restype = i
+        # Sparse entries also take the aligned route's V block change list.
+        extra = [i, p, i] if 'sparse' in name else [i]
+        chunked.argtypes = list(base.argtypes[:-1]) + extra + [sz]
+
+    try:
+        align = library.h3_int8_align_route_v_blocks
+    except AttributeError:
+        pass
+    else:
+        # Additive to ABI 4: route alignment for chunk-scaled V.
+        align.restype = i
+        align.argtypes = [p] * 5 + [i] * 9 + [sz]
 
     try:
         sparse_tiles = library.h3_int8_sparse_attention_tiles

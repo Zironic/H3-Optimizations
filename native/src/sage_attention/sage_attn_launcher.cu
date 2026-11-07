@@ -15,7 +15,7 @@
 namespace {
 
 template <int HEAD_DIM, int CTA_K, MaskMode mask_mode, typename DTypeOut,
-          bool fuse_fp32_probabilities = true>
+          bool fuse_fp32_probabilities = true, bool chunked_v = false>
 void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  float *k_scale, float *v_scale, const void *mask,
                  int64_t mask_stride_b, int64_t mask_stride_h,
@@ -26,7 +26,8 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
                  int stride_seq_k, int stride_h_k, int stride_bz_v,
                  int stride_h_v, int stride_d_v, int stride_bz_o,
                  int stride_seq_o, int stride_h_o, float sm_scale,
-                 int batch_size, cudaStream_t stream) {
+                 int batch_size, cudaStream_t stream,
+                 ChunkedVLaunch chunks = ChunkedVLaunch{}) {
   // Tiling constants — must match sage_attention.py and dlpack_bindings.cpp.
   constexpr int CTA_Q = 128;
   // D>=128 otherwise needs too many live FP32 output accumulators per thread.
@@ -44,7 +45,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
       QuantGranularity::kPerThread, QuantGranularity::kPerThread, float, false,
       DTypeOut, ComputeUnit::kCudaCore, mask_mode, false, true, false, false,
-      fuse_fp32_probabilities>;
+      fuse_fp32_probabilities, chunked_v>;
 
   cudaError_t error = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -64,7 +65,7 @@ void launch_impl(int8_t *q, int8_t *k, int8_t *v, DTypeOut *o, float *q_scale,
       mask_dtype_code, qo_len, kv_len, num_kv_groups, stride_bz_q,
       stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v, stride_bz_o, stride_seq_o,
-      stride_h_o, sm_scale);
+      stride_h_o, sm_scale, chunks.blocks, chunks.shift);
 
   error = cudaGetLastError();
   if (error != cudaSuccess) {
@@ -85,7 +86,8 @@ void launch_sage_attn_kernel(
     int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
-    float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    float sm_scale, int output_dtype_code, cudaStream_t stream,
+    int v_scale_rows) {
   if (cta_k != 64 && cta_k != 128) {
     throw std::runtime_error("sage_attn: cta_k must be 64 or 128");
   }
@@ -103,6 +105,33 @@ void launch_sage_attn_kernel(
   auto qs_ = const_cast<float *>(static_cast<const float *>(q_scale));
   auto ks_ = const_cast<float *>(static_cast<const float *>(k_scale));
   auto vs_ = const_cast<float *>(static_cast<const float *>(v_scale));
+
+  // Chunk-scaled V: production geometry only (head_dim 128, no mask). The
+  // fused FP32 probability path is architecture-neutral, so the short-row
+  // Blackwell variant is not duplicated.
+  const ChunkedVLaunch chunks = chunked_v_launch(v_scale_rows, kv_len);
+  if (chunks.chunked()) {
+    if (head_dim != 128 || mask != nullptr) {
+      throw std::runtime_error(
+          "sage_attn: chunk-scaled V requires unmasked head_dim 128");
+    }
+#define LAUNCH_CHUNKED(CK, DT)                                                   launch_impl<128, CK, MaskMode::kNone, DT, true, true>(                           q_, k_, v_, static_cast<DT *>(o), qs_, ks_, vs_, nullptr, 0, 0, 0, 0,         -1, qo_len, kv_len, num_qo_heads, num_qo_heads / num_kv_heads,                stride_bz_q, stride_seq_q, stride_h_q, stride_bz_k, stride_seq_k,             stride_h_k, stride_bz_v, stride_h_v, stride_d_v, stride_bz_o,                 stride_seq_o, stride_h_o, sm_scale, batch_size, stream, chunks)
+    if (output_dtype_code == 1) {
+      if (cta_k == 128) {
+        LAUNCH_CHUNKED(128, half);
+      } else {
+        LAUNCH_CHUNKED(64, half);
+      }
+    } else {
+      if (cta_k == 128) {
+        LAUNCH_CHUNKED(128, nv_bfloat16);
+      } else {
+        LAUNCH_CHUNKED(64, nv_bfloat16);
+      }
+    }
+#undef LAUNCH_CHUNKED
+    return;
+  }
 
 #define LAUNCH(HD, CK, MM, DT, FUSE_FP32)                                     \
   launch_impl<HD, CK, MM, DT, FUSE_FP32>(                                    \

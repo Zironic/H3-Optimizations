@@ -75,6 +75,15 @@ For normal use, keep these settings:
 - **Attention memory mode: Standard**
 
 Choose **Lower VRAM (slower)** only when you need to reduce the peak further.
+It avoids retaining the full value tensor. On native INT8 attention it
+quantizes each value chunk against its own scale, so values are projected once;
+sparse routes gain a few keys so no kernel step spans two value chunks. This
+changes quantization slightly; measured block-output error was about 3% lower
+than Standard. It needs a passing per-GPU self-test and a
+power-of-two activation chunk size; otherwise, and on compatible SageAttention
+FP8 paths, values are projected a second time instead (two-pass V), which costs
+more time for the same saving. Other attention backends retain values as in
+Standard. Standard remains the default.
 The **Activation chunk rows** control trades temporary memory for throughput;
 the default is the normal recommendation.
 
@@ -153,7 +162,10 @@ are earlier measurements, not fresh paired controls.
 
 Lower VRAM saved a further **384 MiB at 5 seconds and 768 MiB at 10 seconds**
 against that standard fixed-30% path, with measured speed costs of 6.8% and
-5.2%, respectively.
+5.2%, respectively. That row predates chunk-scaled V and ran two-pass V. In
+November 2026 single-block measurements at the same memory, chunk-scaled V cost
++8.9 ms per block against Standard where two-pass cost +22.6 ms at 43k tokens,
+and +25.0 against +38.4 ms at 79.5k tokens.
 
 The fixed-30% row is a constant-budget comparison point, not the current default.
 The current 15% middle budget plus denser-early ramp redistributes roughly the
