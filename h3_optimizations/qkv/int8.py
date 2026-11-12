@@ -55,12 +55,17 @@ class HeldConvRotINT8Linear:
             raise ConvRotINT8BindingError(
                 "module explicitly requests full-precision matmul"
             )
+        # Kitchen quantizes the activation to INT8 inside the GEMM, so FP32 is
+        # as valid an input as BF16. SM75 runs H3 with FP32 manual cast because
+        # ComfyUI offers H3 no FP16 and these cards no BF16 (issue #89).
         if self.sample.ndim < 2 or self.sample.dtype not in (
             torch.bfloat16,
             torch.float16,
+            torch.float32,
         ):
             raise ConvRotINT8BindingError(
-                "ConvRot INT8 execution requires BF16/FP16 activations"
+                "ConvRot INT8 execution requires BF16/FP16/FP32 activations, got %s"
+                % self.sample.dtype
             )
 
         source = describe_linear(self.module)

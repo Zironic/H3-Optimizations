@@ -26,6 +26,7 @@ import comfy.ops  # noqa: E402
 from comfy.quant_ops import TensorWiseINT8Layout  # noqa: E402
 from h3_optimizations.memory import fused_residual  # noqa: E402
 from h3_optimizations.qkv.int8 import (  # noqa: E402
+    ConvRotINT8BindingError,
     HeldConvRotINT8Linear,
     LazyConvRotINT8Linear,
 )
@@ -102,6 +103,56 @@ class RuntimeConvRotINT8Tests(unittest.TestCase):
         self.assertIsNone(binding.weight)
         self.assertEqual(output.dtype, torch.float16)
         self.assertEqual(tuple(output.shape), (2, 256))
+
+    def test_fp32_activation_runs_native_convrot_weight(self):
+        # SM75 executes H3 with FP32 manual cast (issue #89).
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(self.weight, None, object()),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight"):
+            with HeldConvRotINT8Linear(
+                self.module,
+                self.sample[:1],
+                allow_float_conversion=True,
+            ) as binding:
+                native = binding.weight
+        module = floating_linear(native)
+        sample = self.sample.float()
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(native, None, object()),
+        ) as acquire, mock.patch.object(comfy.ops, "uncast_bias_weight"):
+            with HeldConvRotINT8Linear(module, sample[:1]) as binding:
+                self.assertFalse(binding.converted_from_float)
+                output = binding.linear(sample)
+                sliced = binding.linear_range(sample, 0, 96)
+
+        self.assertEqual(acquire.call_args.kwargs["compute_dtype"], torch.float32)
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertEqual(tuple(output.shape), (2, 256))
+        torch.testing.assert_close(sliced, output[:, :96], rtol=0, atol=0)
+
+    def test_fp32_activation_does_not_convert_fp32_weight(self):
+        sample = self.sample.float()
+        weight = self.weight.float()
+        with mock.patch.object(
+            comfy.ops,
+            "cast_bias_weight",
+            return_value=(weight, None, object()),
+        ), mock.patch.object(comfy.ops, "uncast_bias_weight"):
+            with self.assertRaises(ConvRotINT8BindingError):
+                HeldConvRotINT8Linear(
+                    floating_linear(weight),
+                    sample[:1],
+                    allow_float_conversion=True,
+                ).__enter__()
+
+    def test_unsupported_activation_dtype_is_named(self):
+        sample = self.sample.double()
+        with self.assertRaisesRegex(RuntimeError, "got torch.float64"):
+            HeldConvRotINT8Linear(self.module, sample[:1]).__enter__()
 
     def test_lazy_binding_quantizes_once_for_multiple_output_slabs(self):
         handle = object()

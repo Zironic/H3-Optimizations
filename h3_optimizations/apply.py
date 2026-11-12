@@ -383,6 +383,17 @@ def describe_memory_options(attention):
     return '+'.join(installed) if installed else 'baseline'
 
 
+def _execution_dtype(model):
+    """The activation dtype H3 runs in, or None when the model cannot say."""
+    try:
+        dtype = model.get_model_object('manual_cast_dtype')
+        if dtype is None:
+            dtype = model.model.get_dtype_inference()
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return dtype if isinstance(dtype, torch.dtype) else None
+
+
 def _resolve_dense(plan, model, inventory, environment=None):
     memory = plan.memory
     qkv_chunk_rows = (
@@ -452,6 +463,17 @@ def _resolve_dense(plan, model, inventory, environment=None):
         memory_optimize=memory is not None,
         fp8_available=_fp8_execution_available(environment),
     )
+    if qkv.provider_id == QKV_BF16_CHUNKED:
+        execution_dtype = _execution_dtype(model)
+        if execution_dtype is not None and execution_dtype != torch.bfloat16:
+            # The bounded projectors decline every non-BF16 call, so installing
+            # one would only report a path that never runs (issue #89).
+            qkv = QKVProviderResolution(
+                QKV_STANDARD,
+                False,
+                'bounded BF16 QKV needs BF16 H3 execution, got %s'
+                % execution_dtype,
+            )
     backend = None
     projector = None
     if (

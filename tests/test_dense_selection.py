@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 
 PACK = Path(__file__).resolve().parents[1]
@@ -371,6 +373,53 @@ class DenseSelectionTests(unittest.TestCase):
         self.assertEqual(attention.selected, ATTENTION_EXISTING)
         self.assertEqual(attention.projector.name, 'streamed_dense_bf16_qkv')
         self.assertEqual(attention.projector.chunk_rows, 2048)
+
+    def test_fp32_execution_reports_standard_qkv_instead_of_bf16_chunks(self):
+        # SM75 runs H3 with FP32 manual cast (issue #89).
+        model = FakePatcher()
+        model.get_model_object = lambda name: {
+            'manual_cast_dtype': torch.float32,
+        }[name]
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+                chunk_rows=2048,
+            )
+        )
+
+        attention, qkv = apply_module._resolve_dense(
+            plan,
+            model,
+            self._bf16_inventory(),
+        )
+
+        self.assertEqual(qkv.provider_id, QKV_STANDARD)
+        self.assertFalse(qkv.fused)
+        self.assertIn('torch.float32', qkv.reason)
+        self.assertIsNone(attention.projector)
+        self.assertIsNone(attention.backend)
+
+    def test_bf16_execution_keeps_bf16_chunks(self):
+        model = FakePatcher()
+        model.get_model_object = lambda name: {
+            'manual_cast_dtype': None,
+        }[name]
+        model.model = SimpleNamespace(get_dtype_inference=lambda: torch.bfloat16)
+        plan = H3OptimizationPlan().with_memory(
+            MemoryRequest(
+                attention=ATTENTION_EXISTING,
+                fused_qkv=FUSED_QKV_PRESERVE_BF16,
+            )
+        )
+
+        _attention, qkv = apply_module._resolve_dense(
+            plan,
+            model,
+            self._bf16_inventory(),
+        )
+
+        self.assertEqual(qkv.provider_id, QKV_BF16_CHUNKED)
 
     def test_existing_dense_non_bf16_streams_q_against_full_kv(self):
         model = FakePatcher()
