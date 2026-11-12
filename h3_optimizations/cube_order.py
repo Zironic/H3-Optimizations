@@ -64,8 +64,11 @@ class CubeOrderTopology:
         return (start, stop, row.index_select(0, index))
 
     def restore_video_output(self, output):
-        """Return FinalLayer's projected video rows to raster order."""
-        if not isinstance(output, (list, tuple)) or len(output) != 2:
+        """Return FinalLayer's projected video rows to raster order.
+
+        FinalLayer returns (video, audio), or (video,) for MiniMax H3 Image.
+        """
+        if not isinstance(output, (list, tuple)) or len(output) not in (1, 2):
             raise H3CubeOrderPatchError(
                 "MiniMax H3 FinalLayer returned an unexpected output contract"
             )
@@ -81,8 +84,8 @@ class CubeOrderTopology:
         index = torch.tensor(self.inverse, dtype=torch.long, device=video.device)
         restored = video.index_select(0, index)
         if isinstance(output, tuple):
-            return (restored, output[1])
-        return [restored, output[1]]
+            return (restored, *output[1:])
+        return [restored, *output[1:]]
 
 
 class CubeOrderState:
@@ -262,7 +265,7 @@ def _layout(payload, context, padded_video, audio):
         int(padded_video.shape[2]),
         int(padded_video.shape[3]),
         int(padded_video.shape[4]),
-        int(audio.shape[-1]),
+        0 if audio is None else int(audio.shape[-1]),
     )
     layout = payload.get("layout")
     if not _matching_layout(layout, signature):
@@ -288,7 +291,10 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
         audio_denoise_mask=None,
         **kwargs,
     ):
-        video, audio = x[0], x[1]
+        # MiniMax H3 Image denoises one latent tensor and returns one; the
+        # video models take and return [video, audio].
+        single = torch.is_tensor(x)
+        video, audio = (x, None) if single else (x[0], x[1])
         original_shape = tuple(int(value) for value in video.shape[-3:])
         padded_video = common_dit.pad_to_patch_size(video, patch_size)
         grid_shape = patch_grid_shape(padded_video, patch_size)
@@ -307,11 +313,16 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
         )
 
         forward_index = torch.tensor(forward, dtype=torch.long, device=video.device)
-        ordered_x = list(x)
-        ordered_x[0] = reorder_video_patches(padded_video, forward_index, patch_size)
+        ordered_video = reorder_video_patches(padded_video, forward_index, patch_size)
+        if single:
+            ordered_x = ordered_video
+        else:
+            ordered_x = list(x)
+            ordered_x[0] = ordered_video
 
         ordered_mask = denoise_mask
-        if denoise_mask is not None:
+        # The image model ignores per-token denoise masks.
+        if denoise_mask is not None and not single:
             ordered_mask = reorder_video_patches(
                 pad_mask(denoise_mask, padded_video.shape),
                 forward_index,
@@ -331,12 +342,17 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
                 audio_denoise_mask=audio_denoise_mask,
                 **kwargs,
             )
-            if not isinstance(output, (list, tuple)) or len(output) < 2:
+            if single:
+                if not torch.is_tensor(output):
+                    raise H3CubeOrderPatchError(
+                        "MiniMax H3 Image _forward returned an unexpected output contract"
+                    )
+            elif not isinstance(output, (list, tuple)) or len(output) < 2:
                 raise H3CubeOrderPatchError(
                     "MiniMax H3 _forward returned an unexpected output contract"
                 )
 
-            restored = output[0]
+            restored = output if single else output[0]
             if state is None:
                 inverse_index = torch.tensor(
                     inverse, dtype=torch.long, device=video.device
@@ -345,6 +361,9 @@ def make_forward(model, original_forward, cube_shape=CUBE_SHAPE, state=None):
             restored = restored[
                 :, :, :original_shape[0], :original_shape[1], :original_shape[2]
             ]
+            if single:
+                succeeded = True
+                return restored
             result = list(output)
             result[0] = restored
             succeeded = True

@@ -119,6 +119,9 @@ def from_packed_layout(packed):
         elif kind in CONTEXT_KINDS:
             refs.append((kind, a, b))
 
+    if audio_range is None and audio_t == 0 and video_range is not None:
+        # MiniMax H3 Image packs no audio; keep an empty range where it would sit.
+        audio_range = (video_range[0], video_range[0])
     if text_range is None or audio_range is None or video_range is None:
         raise ValueError("unexpected H3 packed layout: missing text/audio/video segment")
 
@@ -145,11 +148,14 @@ def resolve_layout(x, context, payload):
     import comfy.ldm.common_dit
     from comfy.ldm.minimax.model import PackedLayout
 
-    video_x, audio_x = x[0], x[1]
+    # MiniMax H3 Image passes one latent tensor; the video models [video, audio].
+    if hasattr(x, "shape"):
+        video_x, audio_t = x, 0
+    else:
+        video_x, audio_t = x[0], x[1].shape[-1]
     patch = (1, 2, 2)
     video_x = comfy.ldm.common_dit.pad_to_patch_size(video_x, patch)
     latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
-    audio_t = audio_x.shape[-1]
     text_len = context.shape[1]
     signature = (text_len, latent_t, lat_h, lat_w, audio_t)
 

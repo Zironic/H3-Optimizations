@@ -34,6 +34,22 @@ from comfy.model_patcher import ModelPatcher
 sys.argv = [sys.argv[0], *TEST_ARGS]
 
 
+def _core_schedule(heads, shifts=(12.0, 3.0)):
+    '''The last FinalLayer argument the installed core passes for these shifts.'''
+    if hasattr(minimax, 'pdd_grid'):
+        # ComfyUI 0.45+ passes one sigma grid per stream.
+        return tuple(minimax.pdd_grid(heads, shift) for shift in shifts)
+    return shifts
+
+
+def _shifted_grid(heads, shift):
+    '''ComfyUI 0.45's pdd_grid, so grid schedules are testable on any core.'''
+    return [
+        shift * (k / heads) / (1.0 + (shift - 1.0) * (k / heads))
+        for k in range(heads, -1, -1)
+    ]
+
+
 class _Projection(torch.nn.Module):
     comfy_cast_weights = False
     weight_function = ()
@@ -237,7 +253,9 @@ class FinalLayerTests(unittest.TestCase):
         }
         for name, segments in cases.items():
             with self.subTest(name):
-                expected = layer.forward(x, t_emb, *segments, None, None, None)
+                expected = layer.forward(
+                    x, t_emb, *segments, None, None, _core_schedule(1)
+                )
                 actual = final_layer.chunked_final_layer(
                     layer, x, t_emb, *segments, chunk_rows=5,
                 )
@@ -297,12 +315,56 @@ class FinalLayerTests(unittest.TestCase):
         self.assertTrue(torch.allclose(expected[1], actual[1], atol=1e-4, rtol=0))
 
     def test_pdd_head_bank_matches_schedule_weighted_blend(self):
-        self._assert_pdd_head_bank_blend(_PDDLayer())
+        self._assert_pdd_head_bank_blend(_PDDLayer(), (1.0, 2.0))
 
     def test_baked_pdd_head_bank_matches_schedule_weighted_blend(self):
-        self._assert_pdd_head_bank_blend(_BakedPDDLayer())
+        self._assert_pdd_head_bank_blend(_BakedPDDLayer(), (1.0, 2.0))
 
-    def _assert_pdd_head_bank_blend(self, layer):
+    def test_grid_schedule_matches_the_equivalent_flow_shifts(self):
+        # ComfyUI 0.45 passes the shifted grids instead of the shifts. Core
+        # weighs them in float32 rather than float64, so compare relatively.
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        sample_sigmas = torch.tensor([1.0, 0.75, 0.25, 0.0])
+        for layer in (_PDDLayer(), _BakedPDDLayer()):
+            for sigma in sample_sigmas[:-1]:
+                args = (x, None, (0, 7, 0), (7, 11, 1), sigma, sample_sigmas)
+                forward = final_layer.make_forward(layer, 3)
+                shifted = forward(*args, (1.0, 2.0))
+                gridded = forward(
+                    *args, (_shifted_grid(4, 1.0), _shifted_grid(4, 2.0))
+                )
+                for want, got in zip(shifted, gridded):
+                    torch.testing.assert_close(got, want, atol=0, rtol=1e-6)
+
+    def test_one_stream_layer_returns_one_projection(self):
+        # MiniMax H3 Image has no audio head and passes audio_seg=None.
+        layer = _BakedPDDLayer()
+        layer.audio_out = None
+        x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
+        grid = [1.0, 0.9, 0.6, 0.25, 0.0]
+        sample_sigmas = torch.tensor([1.0, 0.6, 0.0])
+        for chunk_rows in (3, None):
+            with self.subTest(chunk_rows=chunk_rows):
+                output = final_layer.make_forward(layer, chunk_rows or 11)(
+                    x, None, (0, 7, 0), None,
+                    torch.tensor(0.6), sample_sigmas, (grid,),
+                )
+                self.assertIsInstance(output, tuple)
+                self.assertEqual(len(output), 1)
+                # sigma 0.6 -> 0.0 spans heads 2 and 3 of this grid.
+                shift, scale = layer.adaln_proj(None)
+                value = (layer.norm(x[0:7]) * (1.0 + scale[0]) + shift[0]).float()
+                weights = layer.video_out.weight.reshape(4, -1, 4)
+                biases = layer.video_out.bias.reshape(4, -1)
+                blend = (0.35 / 0.6, 0.25 / 0.6)
+                expected = torch.nn.functional.linear(
+                    value,
+                    weights[0] + blend[0] * weights[2] + blend[1] * weights[3],
+                    biases[0] + blend[0] * biases[2] + blend[1] * biases[3],
+                )
+                torch.testing.assert_close(output[0], expected, atol=1e-4, rtol=0)
+
+    def _assert_pdd_head_bank_blend(self, layer, schedule):
         x = torch.arange(44, dtype=torch.float32).reshape(11, 4)
         video_seg = (0, 7, 0)
         audio_seg = (7, 11, 1)
@@ -313,7 +375,7 @@ class FinalLayerTests(unittest.TestCase):
             audio_seg,
             torch.tensor(0.75),
             torch.tensor([1.0, 0.75, 0.25, 0.0]),
-            (1.0, 2.0),
+            schedule,
         )
 
         shift, scale = layer.adaln_proj(None)
@@ -391,13 +453,44 @@ class FinalLayerTests(unittest.TestCase):
         segments = ((0, 13, 0), (13, 20, torch.tensor([0, 1, 1, 0, 1, 0, 0])))
         sample_sigmas = torch.tensor([1.0, 0.9, 0.7, 0.4, 0.0])
         forward = final_layer.make_forward(layer, 3)
+        schedule = _core_schedule(heads)
         with torch.inference_mode():
             for sigma in sample_sigmas[:-1]:
-                expected = layer(x, t_emb, *segments, sigma, sample_sigmas, (12.0, 3.0))
-                actual = forward(x, t_emb, *segments, sigma, sample_sigmas, (12.0, 3.0))
+                expected = layer(x, t_emb, *segments, sigma, sample_sigmas, schedule)
+                actual = forward(x, t_emb, *segments, sigma, sample_sigmas, schedule)
                 for want, got in zip(expected, actual):
                     self.assertEqual(want.shape, got.shape)
                     self.assertTrue(torch.allclose(want, got, atol=1e-5, rtol=0))
+
+    @unittest.skipUnless(
+        hasattr(minimax, 'MiniMaxH3ImageModel'),
+        'MiniMax H3 Image needs ComfyUI 0.45+',
+    )
+    def test_one_stream_pdd_head_bank_matches_installed_comfy_final_layer(self):
+        # The image checkpoint has no audio head and its own sigma grid.
+        grid = [1.0, 0.9675, 0.8875, 0.75, 0.5328, 0.232, 0.0]
+        torch.manual_seed(1)
+        layer = minimax.FinalLayer(
+            16, 8, 12, None, 1e-5,
+            operations=comfy.ops.disable_weight_init, pdd_steps=len(grid) - 1,
+        )
+        for module in layer.modules():
+            for name, value in list(module.named_parameters(recurse=False)):
+                setattr(module, name, torch.nn.Parameter(
+                    torch.randn_like(value) * 0.1, requires_grad=False
+                ))
+        x = torch.randn(17, 16)
+        t_emb = torch.randn(2, 8)
+        segment = (3, 17, 1)
+        sample_sigmas = torch.tensor([1.0, 0.95, 0.8, 0.5, 0.2, 0.0])
+        forward = final_layer.make_forward(layer, 4)
+        with torch.inference_mode():
+            for sigma in sample_sigmas[:-1]:
+                expected = layer(x, t_emb, segment, None, sigma, sample_sigmas, (grid,))
+                actual = forward(x, t_emb, segment, None, sigma, sample_sigmas, (grid,))
+                self.assertEqual(len(actual), len(expected))
+                self.assertEqual(actual[0].shape, expected[0].shape)
+                torch.testing.assert_close(actual[0], expected[0], atol=1e-5, rtol=0)
 
     def test_install_is_owned_and_idempotent(self):
         patcher = _Patcher()

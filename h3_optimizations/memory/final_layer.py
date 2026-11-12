@@ -21,13 +21,29 @@ class H3FinalLayerPatchError(RuntimeError):
     pass
 
 
-def _pdd_weights(head, value, n, start, stop, flow_shift):
+def _pdd_blend(n, start, stop, stream_schedule, like):
+    '''Weights of PDD heads start..stop-1, each as its share of the step's dt.'''
+    if torch.is_tensor(stream_schedule) and stream_schedule.ndim == 0:
+        stream_schedule = float(stream_schedule)
+    if isinstance(stream_schedule, (int, float)):
+        # Before ComfyUI 0.45 core passed the stream's flow shift and spaced
+        # the heads on the uniform grid it shifts.
+        grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
+        dt = (
+            1.0
+            - stream_schedule * grid / (1.0 + (stream_schedule - 1.0) * grid)
+        ).diff()[start:stop]
+        return (dt / dt.sum()).to(like)
+    # ComfyUI 0.45+ passes the stream's decreasing sigma grid itself.
+    dt = [
+        stream_schedule[k] - stream_schedule[k + 1] for k in range(start, stop)
+    ]
+    return torch.tensor(dt, dtype=like.dtype, device=like.device) / sum(dt)
+
+
+def _pdd_weights(head, value, n, start, stop, stream_schedule):
     '''Blend the PDD head bank into the one head this step consumes.'''
-    grid = torch.linspace(1.0, 0.0, n + 1, dtype=torch.float64)
-    dt = (
-        1.0 - flow_shift * grid / (1.0 + (flow_shift - 1.0) * grid)
-    ).diff()[start:stop]
-    blend = (dt / dt.sum()).to(value)
+    blend = _pdd_blend(n, start, stop, stream_schedule, value)
     with comfy.ops.CastBiasWeightContext(
         head, value, offloadable=True
     ) as (weight, bias):
@@ -46,6 +62,18 @@ def _pdd_weights(head, value, n, start, stop, flow_shift):
         )
 
 
+def _schedule_grids(schedule):
+    '''Per-stream sigma grids when core passes them (ComfyUI 0.45+), else None.'''
+    if schedule is None or len(schedule) == 0:
+        return None
+    first = schedule[0]
+    if isinstance(first, (list, tuple)) or (
+        torch.is_tensor(first) and first.ndim > 0
+    ):
+        return schedule
+    return None
+
+
 def chunked_final_layer(
     layer,
     x,
@@ -55,8 +83,15 @@ def chunked_final_layer(
     chunk_rows,
     sigma=None,
     sample_sigmas=None,
-    shifts=None,
+    schedule=None,
 ):
+    '''Project the target streams chunk by chunk.
+
+    ``schedule`` is core's last FinalLayer argument: the (video, audio) flow
+    shifts before ComfyUI 0.45, one sigma grid per stream since. A model
+    without an audio stream, MiniMax H3 Image, passes ``audio_seg=None`` and
+    gets a one-element result, as from core.
+    '''
     shift, scale = layer.adaln_proj(t_emb)
 
     # ComfyUI 0.42+ sizes baked PDD heads at full width and records video_dim;
@@ -72,15 +107,24 @@ def chunked_final_layer(
             )
         i = int((sample_sigmas - sigma).abs().argmin())
         sigma_next = sample_sigmas[min(i + 1, sample_sigmas.shape[0] - 1)]
-        start, stop = (
-            round(float(1.0 - time_shift_sigma(s, shifts[0], 1.0)) * n)
-            for s in (sigma, sigma_next)
-        )
+        grids = _schedule_grids(schedule)
+        if grids is None:
+            start, stop = (
+                round(float(1.0 - time_shift_sigma(s, schedule[0], 1.0)) * n)
+                for s in (sigma, sigma_next)
+            )
+        else:
+            # The video grid picks the heads: the grid points nearest the
+            # step's endpoints.
+            start, stop = (
+                min(range(n + 1), key=lambda k: abs(grids[0][k] - float(s)))
+                for s in (sigma, sigma_next)
+            )
         start = min(start, n - 1)
         stop = max(stop, start + 1)
         pdd = (n, start, stop)
 
-    def project(segment, output, flow_shift=None):
+    def project(segment, output, stream_schedule=None):
         first, last, row = segment
         step = int(chunk_rows)
         per_token = torch.is_tensor(row) and row.ndim > 0
@@ -108,7 +152,7 @@ def chunked_final_layer(
                 projected = output(value)
             else:
                 if head is None:
-                    head = _pdd_weights(output, value, *pdd, flow_shift)
+                    head = _pdd_weights(output, value, *pdd, stream_schedule)
                 projected = torch.nn.functional.linear(value, *head)
             del value
             if result is None:
@@ -121,11 +165,12 @@ def chunked_final_layer(
             del projected
         return result
 
-    video_shift = shifts[0] if pdd is not None else None
-    audio_shift = shifts[1] if pdd is not None else None
-    return (
-        project(video_seg, layer.video_out, video_shift),
-        project(audio_seg, layer.audio_out, audio_shift),
+    streams = [(video_seg, layer.video_out)]
+    if audio_seg is not None and getattr(layer, 'audio_out', None) is not None:
+        streams.append((audio_seg, layer.audio_out))
+    return tuple(
+        project(segment, output, None if pdd is None else schedule[index])
+        for index, (segment, output) in enumerate(streams)
     )
 
 
@@ -155,7 +200,7 @@ def make_forward(
         audio_seg,
         sigma=None,
         sample_sigmas=None,
-        shifts=None,
+        schedule=None,
     ):
         topology = None
         active = False
@@ -169,7 +214,10 @@ def make_forward(
             if not announced:
                 announced.append(True)
                 video_rows = int(video_seg[1]) - int(video_seg[0])
-                audio_rows = int(audio_seg[1]) - int(audio_seg[0])
+                audio_rows = (
+                    0 if audio_seg is None
+                    else int(audio_seg[1]) - int(audio_seg[0])
+                )
                 logging.debug(
                     '[H3 Optimizations] chunked FinalLayer ran: %d rows, '
                     'video %d in %d chunk(s), audio %d in %d chunk(s), '
@@ -190,7 +238,7 @@ def make_forward(
                 signature,
                 sigma,
                 sample_sigmas,
-                shifts,
+                schedule,
             )
         else:
             output = original_forward(
@@ -200,7 +248,7 @@ def make_forward(
                 audio_seg,
                 sigma,
                 sample_sigmas,
-                shifts,
+                schedule,
             )
 
         return output if topology is None else topology.restore_video_output(output)
