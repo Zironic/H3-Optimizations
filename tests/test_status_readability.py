@@ -86,6 +86,28 @@ class QKVStatusReadabilityTests(unittest.TestCase):
             }
         )
 
+    def test_per_head_budget_line_reports_what_runs(self):
+        cases = (
+            ({'head_budgets': 'Calibrated', 'head_budgets_active': True}, 'sparse_kitchen_int8',
+             'Per-head budgets: calibrated'),
+            ({'head_budgets': 'Off', 'head_budgets_active': False}, 'sparse_kitchen_int8',
+             'Per-head budgets: off (one shared budget per layer)'),
+            ({'head_budgets': 'Calibrated', 'head_budgets_active': False}, 'sparse_kitchen_int8',
+             'Per-head budgets: off (calibrated for the 1x8x8 token order)'),
+            ({'head_budgets': 'Calibrated', 'head_budgets_active': True}, 'sparse_sage',
+             'Per-head budgets: not used by this backend'),
+        )
+        for sparse, selected, expected in cases:
+            with self.subTest(expected=expected):
+                status = dict(self.status, attention={'selected': selected},
+                              sparse=dict(self.status['sparse'], **sparse))
+                model = SimpleNamespace(model_options={'transformer_options': {STATUS_KEY: status}})
+                text = format_sparse_status(model)
+                self.assertIn(expected, text)
+                lines = text.splitlines()
+                budget = next(i for i, line in enumerate(lines) if line.startswith('Requested video KV budget'))
+                self.assertTrue(lines[budget + 1].startswith('Per-head budgets:'))
+
     def test_ignored_lower_vram_request_is_reported_not_silent(self):
         model = self._status_with_v_memory('two_pass', None)
 

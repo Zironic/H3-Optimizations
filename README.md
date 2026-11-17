@@ -114,6 +114,15 @@ at or above 50% are unchanged.
 A `1.0` budget still enters the Sparse node's backend-selection path. Bypass the
 node when you want the ordinary dense baseline.
 
+**Per-head budgets** are on by default. H3's attention heads are not equally
+sensitive to the connections sparse attention removes, so a bundled
+calibration lets each head of a layer keep a different share of that layer's
+budget, while the layer as a whole does the same amount of work as before. It
+needs no extra kernel and costs no measurable time. It applies to the default
+Kitchen INT8 64Q x 32KV backend with threshold routing and the 1x8x8 token
+order; every other backend, geometry, and order keeps one shared budget. The
+Advanced node can turn it off.
+
 VSA-trained checkpoints such as FastH3 must use **H3 VSA Attention (FastH3)**
 instead. The normal Sparse nodes detect their learned gate layers and leave the
 model unchanged rather than applying an incompatible sparse pattern.
@@ -236,6 +245,9 @@ order.
 - **Kitchen INT8 64Q x 128KV (Faster)** uses coarser KV tiles. It was faster in
   the measured SM89 full-block comparison, but can change quality and is not
   guaranteed to be faster on every GPU.
+- **Per-head budgets** defaults to **Calibrated**. **Off** gives every head the
+  same budget, as earlier releases did. It only has an effect on 64Q x
+  32KV threshold routes with the 1x8x8 token order.
 
 The Advanced defaults use an eight-step **Ramp** starting at **68.33%** and
 moving toward the 15% middle budget, with no late override on the default
@@ -395,6 +407,23 @@ threshold routing using BF16 summaries. The requested budget targets average
 video density rather than an exact per-row tile count. Non-video context stays
 dense, 100% KV uses a full route, and builds without the threshold router retain
 top-k selection. Explicit 64KV and 128KV backends remain available.
+
+Threshold routing keeps a video tile when its score is above `mean + tau * std`
+for that query tile. By default one `tau`, from the step's budget, serves every
+head. With **Per-head budgets** on, a bundled table
+(`h3_optimizations/data/head_budgets_t32_v1.json.gz`) gives each head of a layer
+its own `tau_h`. The heads of each layer together spend the realized tiles the
+shared `tau` would have. `tau_h` is applied by scaling that head's K covariance
+in the route plan by `(tau_h / tau)^2`, so the native router and kernels are
+unchanged. The table holds per-(layer, head) error and realized-density curves.
+It was calibrated on 64Q x 32KV threshold routing with the 1x8x8 order over 14
+T2VA, I2V, FL2VA, and Ref2VA runs, and it covers H3's 56-head, 50-layer
+transformer. Uncalibrated geometries, head counts, and layers keep the shared
+`tau`, as do budgets within 2 points of 50%, where `tau` changes sign. On 5 s
+and 10 s Turbo8 tests at matched compute, layer attention error was lower in
+299 of 300 per-layer measurements (by 9% at a 42% budget and 20-30% at 10-15%).
+The two most budget-sensitive late layers improved 2-4x, and blind and paired
+video comparisons showed less ghosting and detail closer to dense.
 
 For compatible ConvRot-256 INT8 checkpoints on SM80+, the path can use an exact
 fused Q producer. Q projection dimensions are 128x256, while packed32 routing

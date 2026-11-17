@@ -52,6 +52,7 @@ from ...qkv.streamed import (
     project_q_hnd,
     project_v_hnd,
 )
+from . import head_budget
 from .config import resolve_video_budget
 from .kitchen_sparse import (
     OUTPUT_NHD,
@@ -109,6 +110,8 @@ class _StreamedRoutePlan:
     k_mean: torch.Tensor | None = None
     k_cov: torch.Tensor | None = None
     tau: float = 0.0
+    # Per-head fractions when calibrated per-head tau scaled k_cov (head_budget.py).
+    head_fractions: tuple[float, ...] | None = None
 
     def release(self):
         self.k_summary = None
@@ -481,9 +484,22 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         ROUTE_MODE_KEY, DEFAULT_ROUTE_MODE
                     ),
                 )
+            if getattr(self.config, "head_budgets", False) and not (
+                (transformer_options or {}).get(head_budget.HEAD_BUDGETS_OFF_KEY, False)
+            ):
+                with diagnostics.stage("sparse_route"):
+                    head_budget.apply_head_tau(
+                        route_plan,
+                        layer_index,
+                        q_tile=self.executor.q_tile,
+                        kv_tile=self.executor.kv_tile,
+                    )
         except SparseRouterError as exc:
             projected.release()
             raise SparseKitchenError("sparse routing failed: %s" % exc) from exc
+        except head_budget.HeadBudgetError as exc:
+            projected.release()
+            raise SparseKitchenError("per-head sparse budgets failed: %s" % exc) from exc
 
         projected.k_summary = None
         dense_query_rows = 0
@@ -510,6 +526,7 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
             {
                 "qkv_lifetime": "streamed_q_global_kitchen_kv",
                 "route_mode": route_plan.mode,
+                "head_budgets": route_plan.head_fractions is not None,
                 "dense_query_rows": dense_query_rows,
                 "router_lifetime": "k_summary_q_slab_selection_lazy_kitchen_lut",
                 "attention_output": "chunked_out_proj_inplace",

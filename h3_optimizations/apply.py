@@ -344,6 +344,7 @@ def _sparse_config_kwargs(plan):
         'late_kv': sparse.late_kv,
         'early_schedule': sparse.early_schedule,
         'step_video_budgets': sparse.step_video_budgets,
+        'head_budgets': bool(sparse.head_budgets_active),
         'strict': True,
     }
 
@@ -1269,6 +1270,8 @@ def _status(
                 'late_kv': plan.sparse.late_kv,
                 'early_schedule': plan.sparse.early_schedule,
                 'video_token_order': plan.sparse.video_token_order,
+                'head_budgets': plan.sparse.head_budgets,
+                'head_budgets_active': bool(plan.sparse.head_budgets_active),
                 'step_video_budgets': (
                     None
                     if plan.sparse.step_video_budgets is None

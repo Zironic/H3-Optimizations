@@ -4,6 +4,8 @@ from .plan import (
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_RAMP,
     PLAN_KEY,
+    HEAD_BUDGETS_OFF,
+    HEAD_BUDGETS_TOKEN_ORDER,
     SPARSE_BACKEND_AUTO,
     STATUS_KEY,
 )
@@ -385,6 +387,21 @@ def format_sparse_status(model):
             'non-video context and mixed boundary tiles remain dense.'
         ),
     ]
+    head_request = sparse.get('head_budgets') or getattr(plan_sparse, 'head_budgets', None)
+    if head_request is not None:
+        if head_request == HEAD_BUDGETS_OFF:
+            head_line = 'Per-head budgets: off (one shared budget per layer)'
+        elif not sparse.get('head_budgets_active', getattr(plan_sparse, 'head_budgets_active', False)):
+            head_line = 'Per-head budgets: off (calibrated for the %s token order)' % HEAD_BUDGETS_TOKEN_ORDER
+        elif selected != 'sparse_kitchen_int8':
+            head_line = 'Per-head budgets: not used by this backend (one shared budget per layer)'
+        else:
+            head_line = 'Per-head budgets: calibrated (Kitchen 64Q x 32KV threshold routes)'
+        budget_line = next(
+            index for index, line in enumerate(lines)
+            if line.startswith('Requested video KV budget:')
+        )
+        lines.insert(budget_line + 1, head_line)
     if backend_request != SPARSE_BACKEND_AUTO:
         lines.insert(1, 'Requested sparse backend: %s' % backend_request)
     elif selected != 'sparse_kitchen_int8' and reason:

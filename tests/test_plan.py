@@ -136,13 +136,19 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(request.advanced_schedule)
         self.assertIn(SPARSE_BACKEND_TRITON, request.signature)
         self.assertIn(EARLY_SCHEDULE_RAMP, request.signature)
-        self.assertEqual(request.signature[-6:-2], (2, 0.5, 2, 0.5))
+        self.assertEqual(request.signature[-7:-3], (2, 0.5, 2, 0.5))
 
     def test_video_token_order_is_validated_and_part_of_identity(self):
         request = SparseRequest(video_token_order=VIDEO_TOKEN_ORDER_RASTER)
-        self.assertEqual(request.signature[-1], VIDEO_TOKEN_ORDER_RASTER)
+        self.assertEqual(request.signature[-2], VIDEO_TOKEN_ORDER_RASTER)
         with self.assertRaisesRegex(ValueError, 'unknown video token order'):
             SparseRequest(video_token_order='2x4x8')
+
+    def test_head_budgets_are_validated_and_part_of_identity(self):
+        self.assertEqual(SparseRequest().signature[-1], 'Calibrated')
+        self.assertEqual(SparseRequest(head_budgets='Off').signature[-1], 'Off')
+        with self.assertRaisesRegex(ValueError, 'unknown per-head budget request'):
+            SparseRequest(head_budgets='Uniform')
 
     def test_node_order_does_not_change_the_plan(self):
         memory = MemoryRequest()

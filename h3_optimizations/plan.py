@@ -145,6 +145,12 @@ VIDEO_TOKEN_ORDER_REQUESTS = (
     VIDEO_TOKEN_ORDER_4X4X4,
     VIDEO_TOKEN_ORDER_RASTER,
 )
+# Per-head budgets: the bundled calibration was measured on this token order.
+HEAD_BUDGETS_CALIBRATED = 'Calibrated'
+HEAD_BUDGETS_OFF = 'Off'
+HEAD_BUDGETS_REQUESTS = (HEAD_BUDGETS_CALIBRATED, HEAD_BUDGETS_OFF)
+DEFAULT_HEAD_BUDGETS = HEAD_BUDGETS_CALIBRATED
+HEAD_BUDGETS_TOKEN_ORDER = VIDEO_TOKEN_ORDER_1X8X8
 EARLY_SCHEDULE_HOLD = 'Hold'
 EARLY_SCHEDULE_RAMP = 'Ramp'
 EARLY_SCHEDULE_OPTIONS = (
@@ -261,9 +267,12 @@ class SparseRequest:
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
     video_token_order: str = DEFAULT_VIDEO_TOKEN_ORDER
+    head_budgets: str = DEFAULT_HEAD_BUDGETS
 
     def __post_init__(self):
         _validate_sparse_budget('video_budget', self.video_budget)
+        if self.head_budgets not in HEAD_BUDGETS_REQUESTS:
+            raise ValueError('unknown per-head budget request %r' % self.head_budgets)
         if self.backend in (
             SPARSE_BACKEND_KITCHEN_64X64_LEGACY,
             SPARSE_BACKEND_KITCHEN_LEGACY,
@@ -339,6 +348,15 @@ class SparseRequest:
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
             self.video_token_order,
+            self.head_budgets,
+        )
+
+    @property
+    def head_budgets_active(self):
+        '''Whether the calibrated per-head table can apply: requested and on its token order.'''
+        return (
+            self.head_budgets == HEAD_BUDGETS_CALIBRATED
+            and self.video_token_order == HEAD_BUDGETS_TOKEN_ORDER
         )
 
 

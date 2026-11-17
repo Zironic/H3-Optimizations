@@ -9,12 +9,14 @@ from .apply import apply_plan
 from .node_constants import NODE_CATEGORY
 from .plan import (
     DEFAULT_EDGE_KV,
+    DEFAULT_HEAD_BUDGETS,
     DEFAULT_LATE_STEPS,
     DEFAULT_VIDEO_BUDGET,
     DEFAULT_VIDEO_TOKEN_ORDER,
     EARLY_SCHEDULE_HOLD,
     EARLY_SCHEDULE_OPTIONS,
     EARLY_SCHEDULE_RAMP,
+    HEAD_BUDGETS_REQUESTS,
     SPARSE_BACKEND_COMPAT_REQUESTS,
     SPARSE_BACKEND_KITCHEN_64X32,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
@@ -298,6 +300,21 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                         'Raster restores unchanged H3 target-video ordering.'
                     ),
                 ),
+                io.Combo.Input(
+                    'head_budgets',
+                    display_name='Per-head budgets',
+                    options=list(HEAD_BUDGETS_REQUESTS),
+                    default=DEFAULT_HEAD_BUDGETS,
+                    tooltip=(
+                        'Calibrated gives each attention head its own share of a '
+                        "layer's video budget from a bundled calibration, at the "
+                        'same total compute: heads that lose more when tiles are '
+                        'dropped keep more. It applies to Kitchen INT8 64Q x 32KV '
+                        'threshold routing with the 1x8x8 token order; other '
+                        'backends, geometries and orders keep one shared budget. '
+                        'Off restores one shared budget for every head.'
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -314,6 +331,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         backend=SPARSE_BACKEND_KITCHEN_64X32,
         early_schedule=_ADVANCED_DEFAULT_EARLY_SCHEDULE,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        head_budgets=DEFAULT_HEAD_BUDGETS,
     ):
         passthrough = _vsa_passthrough(model)
         if passthrough is not None:
@@ -328,6 +346,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                 backend=backend,
                 early_schedule=early_schedule,
                 video_token_order=video_token_order,
+                head_budgets=head_budgets,
             )
         )
         patched = apply_plan(model, plan)
@@ -347,7 +366,10 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         late_steps=DEFAULT_LATE_STEPS,
         late_kv=DEFAULT_EDGE_KV,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
+        head_budgets=DEFAULT_HEAD_BUDGETS,
     ):
+        if head_budgets is not None and head_budgets not in HEAD_BUDGETS_REQUESTS:
+            return 'unknown per-head budget option %r' % head_budgets
         if backend is not None and backend not in SPARSE_BACKEND_COMPAT_REQUESTS:
             return 'unknown sparse backend %r' % backend
         if early_schedule is not None and early_schedule not in EARLY_SCHEDULE_OPTIONS:

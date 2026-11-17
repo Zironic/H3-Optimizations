@@ -190,6 +190,7 @@ def test_advanced_node_schema_and_request():
             'backend',
             'early_schedule',
             'video_token_order',
+            'head_budgets',
         ],
         'advanced schema exposes only production sparse controls',
     )

@@ -39,6 +39,8 @@ class HybridSparseConfig:
     late_kv: float | None = None
     early_schedule: str = EARLY_SCHEDULE_HOLD
     step_video_budgets: tuple[float, ...] | None = None
+    # Calibrated per-head tau on threshold routes (attention/sparse/head_budget.py).
+    head_budgets: bool = False
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
             raise ValueError(
@@ -93,6 +95,7 @@ class HybridSparseConfig:
             None if self.late_steps is None else int(self.late_steps),
             None if self.late_kv is None else float(self.late_kv),
             self.step_video_budgets,
+            bool(self.head_budgets),
         )
 
 

@@ -82,6 +82,7 @@ class NodeTests(unittest.TestCase):
                 'backend',
                 'early_schedule',
                 'video_token_order',
+                'head_budgets',
             ],
         )
         self.assertEqual(
@@ -136,6 +137,11 @@ class NodeTests(unittest.TestCase):
             video_token_order.options,
             list(VIDEO_TOKEN_ORDER_REQUESTS),
         )
+        head_budgets = input_by_id(advanced, 'head_budgets')
+        self.assertEqual(head_budgets.default, 'Calibrated')
+        self.assertEqual(head_budgets.options, ['Calibrated', 'Off'])
+        self.assertIsInstance(
+            H3SparseAttentionAdvanced.validate_inputs('auto', head_budgets='Uniform'), str)
         self.assertTrue(H3SparseAttentionAdvanced.validate_inputs('auto'))
         self.assertIsInstance(
             H3SparseAttentionAdvanced.validate_inputs(
