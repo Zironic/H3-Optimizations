@@ -484,8 +484,11 @@ class StreamedSparseKitchenBackend(_BaseSparseKitchenBackend):
                         ROUTE_MODE_KEY, DEFAULT_ROUTE_MODE
                     ),
                 )
-            if getattr(self.config, "head_budgets", False) and not (
-                (transformer_options or {}).get(head_budget.HEAD_BUDGETS_OFF_KEY, False)
+            # MiniMax H3 Image packs no audio (audio_t == 0); the table is calibrated on the video models only.
+            if (
+                getattr(self.config, "head_budgets", False)
+                and getattr(snapshot.layout, "audio_t", None) != 0
+                and not (transformer_options or {}).get(head_budget.HEAD_BUDGETS_OFF_KEY, False)
             ):
                 with diagnostics.stage("sparse_route"):
                     head_budget.apply_head_tau(

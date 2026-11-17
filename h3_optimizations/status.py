@@ -391,6 +391,8 @@ def format_sparse_status(model):
     if head_request is not None:
         if head_request == HEAD_BUDGETS_OFF:
             head_line = 'Per-head budgets: off (one shared budget per layer)'
+        elif sparse.get('head_budgets_skipped'):
+            head_line = 'Per-head budgets: off (not calibrated for %s)' % sparse['head_budgets_skipped']
         elif not sparse.get('head_budgets_active', getattr(plan_sparse, 'head_budgets_active', False)):
             head_line = 'Per-head budgets: off (calibrated for the %s token order)' % HEAD_BUDGETS_TOKEN_ORDER
         elif selected != 'sparse_kitchen_int8':

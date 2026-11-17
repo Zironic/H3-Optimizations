@@ -41,6 +41,15 @@ def is_minimax_h3(model_patcher, model_type=None):
     return get_minimax_h3_model(model_patcher, model_type=model_type) is not None
 
 
+def is_minimax_h3_image(model_patcher):
+    """Whether the diffusion model is MiniMax H3 Image (ComfyUI 0.45+), which has no audio stream."""
+    try:
+        from comfy.ldm.minimax.model import MiniMaxH3ImageModel
+    except ImportError:
+        return False
+    return get_minimax_h3_model(model_patcher, model_type=MiniMaxH3ImageModel) is not None
+
+
 def get_h3_blocks(model_patcher, model_type=None):
     model = get_minimax_h3_model(model_patcher, model_type=model_type)
     if model is None:

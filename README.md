@@ -120,8 +120,9 @@ calibration lets each head of a layer keep a different share of that layer's
 budget, while the layer as a whole does the same amount of work as before. It
 needs no extra kernel and costs no measurable time. It applies to the default
 Kitchen INT8 64Q x 32KV backend with threshold routing and the 1x8x8 token
-order; every other backend, geometry, and order keeps one shared budget. The
-Advanced node can turn it off.
+order; every other backend, geometry, and order keeps one shared budget, as
+does MiniMax H3 Image, which the table was not calibrated for. The Advanced
+node can turn it off.
 
 VSA-trained checkpoints such as FastH3 must use **H3 VSA Attention (FastH3)**
 instead. The normal Sparse nodes detect their learned gate layers and leave the
@@ -418,8 +419,8 @@ in the route plan by `(tau_h / tau)^2`, so the native router and kernels are
 unchanged. The table holds per-(layer, head) error and realized-density curves.
 It was calibrated on 64Q x 32KV threshold routing with the 1x8x8 order over 14
 T2VA, I2V, FL2VA, and Ref2VA runs, and it covers H3's 56-head, 50-layer
-transformer. Uncalibrated geometries, head counts, and layers keep the shared
-`tau`, as do budgets within 2 points of 50%, where `tau` changes sign. On 5 s
+transformer. MiniMax H3 Image (recognized by its missing audio stream),
+uncalibrated geometries, head counts, and layers keep the shared `tau`, as do budgets within 2 points of 50%, where `tau` changes sign. On 5 s
 and 10 s Turbo8 tests at matched compute, layer attention error was lower in
 299 of 300 per-layer measurements (by 9% at a 42% budget and 20-30% at 10-15%).
 The two most budget-sensitive late layers improved 2-4x, and blind and paired

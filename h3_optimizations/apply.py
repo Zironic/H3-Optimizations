@@ -77,7 +77,7 @@ from .memory.fused_residual import (
 )
 from .memory.final_layer import install as install_final_layer
 from .memory.patch import install as install_memory_patch
-from .model import get_h3_blocks, is_minimax_h3
+from .model import get_h3_blocks, is_minimax_h3, is_minimax_h3_image
 from .patch import clear_backend, configure_backend
 from .plan import (
     ATTENTION_EXISTING,
@@ -1584,6 +1584,12 @@ def _reconcile_plan(
         canonical_quantization=patched.model_options.get(CANONICAL_QUANT_KEY),
     )
     options[STATUS_KEY]['memory_options'] = describe_memory_options(attention)
+    sparse_status = options[STATUS_KEY].get('sparse')
+    if isinstance(sparse_status, dict) and is_minimax_h3_image(patched):
+        # The per-head table is calibrated on the video models; the runtime gate skips H3 Image.
+        sparse_status['head_budgets_active'] = False
+        sparse_status['head_budgets_skipped'] = 'MiniMax H3 Image'
+
     session = options.get(RUNTIME_SESSION_KEY)
     preserved = {
         'attention': list(options.get(

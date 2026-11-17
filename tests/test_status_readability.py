@@ -96,6 +96,9 @@ class QKVStatusReadabilityTests(unittest.TestCase):
              'Per-head budgets: off (calibrated for the 1x8x8 token order)'),
             ({'head_budgets': 'Calibrated', 'head_budgets_active': True}, 'sparse_sage',
              'Per-head budgets: not used by this backend'),
+            ({'head_budgets': 'Calibrated', 'head_budgets_active': False,
+              'head_budgets_skipped': 'MiniMax H3 Image'}, 'sparse_kitchen_int8',
+             'Per-head budgets: off (not calibrated for MiniMax H3 Image)'),
         )
         for sparse, selected, expected in cases:
             with self.subTest(expected=expected):

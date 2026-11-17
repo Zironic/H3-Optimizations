@@ -179,7 +179,7 @@ class RequestWiringTests(unittest.TestCase):
 
 
 class BackendWiringTests(unittest.TestCase):
-    def _prepare(self, config, options):
+    def _prepare(self, config, options, layout=None):
         plan = _plan(196)
         original = plan.k_cov.clone()
         backend = ksq.StreamedSparseKitchenBackend.__new__(ksq.StreamedSparseKitchenBackend)
@@ -189,7 +189,7 @@ class BackendWiringTests(unittest.TestCase):
         carrier = SimpleNamespace(k=torch.zeros(1, HEADS, 8, 8), cta_k=32)
         projected = ksq.StreamedSparseKitchenQKV(
             SimpleNamespace(), SimpleNamespace(), torch.zeros(16, 4), None, carrier, torch.zeros(1), 'native', None)
-        snapshot = SimpleNamespace(step_index=0, total_steps=1, layout=None)
+        snapshot = SimpleNamespace(step_index=0, total_steps=1, layout=layout)
         with mock.patch.object(ksq, 'snapshot_for', return_value=snapshot), \
              mock.patch.object(ksq, '_prepare_route_plan', return_value=(plan, {})), \
              mock.patch.object(ksq, 'route_metadata', return_value={}):
@@ -211,6 +211,28 @@ class BackendWiringTests(unittest.TestCase):
                                            {hb.HEAD_BUDGETS_OFF_KEY: True})
         self.assertIsNone(prepared.route_plan.head_fractions, 'the per-forward off switch keeps the shared tau')
         self.assertTrue(torch.equal(prepared.route_plan.k_cov, original))
+
+    def test_h3_image_keeps_the_shared_tau(self):
+        # MiniMax H3 Image packs no audio; the table is calibrated on the video models only.
+        config = HybridSparseConfig(video_budget=0.15, head_budgets=True)
+        prepared, original = self._prepare(config, {}, layout=SimpleNamespace(audio_t=0))
+        self.assertIsNone(prepared.route_plan.head_fractions)
+        self.assertTrue(torch.equal(prepared.route_plan.k_cov, original))
+        prepared, _ = self._prepare(config, {}, layout=SimpleNamespace(audio_t=31))
+        self.assertIsNotNone(prepared.route_plan.head_fractions, 'video models with audio keep per-head budgets')
+
+    def test_h3_image_detection(self):
+        from h3_optimizations import model as h3_model
+        try:
+            from comfy.ldm.minimax.model import MiniMaxH3ImageModel, MiniMaxH3Model
+        except ImportError:
+            self.skipTest('this ComfyUI predates MiniMax H3 Image')
+
+        def patcher(cls):
+            instance = cls.__new__(cls)
+            return SimpleNamespace(get_model_object=lambda name: instance)
+        self.assertTrue(h3_model.is_minimax_h3_image(patcher(MiniMaxH3ImageModel)))
+        self.assertFalse(h3_model.is_minimax_h3_image(patcher(MiniMaxH3Model)))
 
 
 if __name__ == '__main__':
