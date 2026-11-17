@@ -191,6 +191,8 @@ these numbers.
 ## Compatibility at a glance
 
 - ComfyUI 0.40.0 or newer with MiniMax H3 support
+- MiniMax H3 video checkpoints, including PDD checkpoints and PDD LoRAs;
+  MiniMax H3 Image on ComfyUI 0.45 or newer
 - Python 3.10 or newer
 - Windows x64 or Linux x86-64 for the shipped native Kitchen binaries
 - NVIDIA SM75 or newer for the shipped native Kitchen path
